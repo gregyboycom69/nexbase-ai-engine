@@ -1,0 +1,251 @@
+"use client";
+
+import { AssistantSettings } from "@/components/assistant/assistant-settings";
+
+import Link from "next/link";
+import { ArrowUpRight, Smartphone } from "lucide-react";
+import { ROUTES } from "@/lib/constants";
+import { useState } from "react";
+import { AlertTriangle, KeyRound, LogOut, Lock } from "lucide-react";
+import { toast } from "sonner";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+  Button,
+  FormField,
+  Input,
+} from "@/components/ui";
+import { getErrorMessage } from "@/lib/api-error";
+import { ActiveSessions } from "@/components/dashboard/active-sessions";
+import { SectionCard } from "@/components/settings/settings-section";
+import { useAuth } from "@/hooks";
+import { apiClient, ApiError } from "@/lib/api-client";
+import { useTranslations } from "next-intl";
+
+export default function AccountSettingsPage() {
+  const tErrors = useTranslations("errors");
+
+  const t = useTranslations("pages.settings");
+  const nav = useTranslations("nav");
+  const { user, logout } = useAuth();
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const handleChangePassword = async () => {
+    if (newPassword.length < 8) {
+      toast.error(t("newPasswordMustBe"));
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      toast.error(t("passwordsDoNotMatch"));
+      return;
+    }
+    setSaving(true);
+    try {
+      await apiClient.post("/auth/password/change", {
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+      toast.success(t("passwordUpdated"));
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError ? getErrorMessage(err, tErrors) : t("failedUpdatePassword"),
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!user) return;
+    setDeleting(true);
+    try {
+      await apiClient.delete(`/users/${user.id}`);
+      toast.success(t("accountDeleted"));
+      logout();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        toast.error(t("selfDeleteNotEnabled"));
+      } else {
+        toast.error(
+          err instanceof ApiError ? getErrorMessage(err, tErrors) : t("failedDeleteAccount"),
+        );
+      }
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-5">
+      <SectionCard
+        icon={KeyRound}
+        title={t("changePassword")}
+        description={t("useStrongUniquePassword")}
+      >
+        <form
+          className="space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void handleChangePassword();
+          }}
+        >
+          <FormField label={t("currentPassword")} htmlFor="current-pw">
+            <Input
+              id="current-pw"
+              disabled={saving}
+              type="password"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              autoComplete="current-password"
+            />
+          </FormField>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <FormField label={t("newPassword")} htmlFor="new-pw">
+              <Input
+                id="new-pw"
+                disabled={saving}
+                type="password"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+            </FormField>
+            <FormField label={t("confirmNewPassword")} htmlFor="confirm-pw">
+              <Input
+                id="confirm-pw"
+                disabled={saving}
+                type="password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+            </FormField>
+          </div>
+          <div className="pt-1">
+            <Button
+              type="submit"
+              loading={saving}
+              disabled={saving || !currentPassword || !newPassword || !confirmPassword}
+            >
+              {t("updatePassword")}
+            </Button>
+          </div>
+        </form>
+      </SectionCard>
+
+      <ActiveSessions />
+      <SectionCard
+        icon={Smartphone}
+        title={nav("mobileApp")}
+        description={t("mobileAccountHint")}
+        action={
+          <Button asChild variant="outline">
+            <Link href={ROUTES.SETTINGS_MOBILE}>
+              {t("openMobileApp")}
+              <ArrowUpRight aria-hidden className="size-4" />
+            </Link>
+          </Button>
+        }
+      />
+
+      <SectionCard
+        icon={LogOut}
+        title={t("signOutEverywhere")}
+        description={t("revokeEveryActiveSession")}
+      >
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button variant="outline" size="sm">
+              <Lock className="mr-2 h-3.5 w-3.5" />
+              {t("signOutEverywhere")}
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t("signOutFromAll")}</AlertDialogTitle>
+              <AlertDialogDescription>{t("revokesEveryActiveSession")}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={async () => {
+                  try {
+                    await apiClient.delete("/sessions");
+                    toast.success(t("signedOutFromAll"));
+                    logout();
+                  } catch {
+                    toast.error(t("failedSignOutEverywhere"));
+                  }
+                }}
+              >
+                {t("signOutEverywhere2")}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </SectionCard>
+
+      <SectionCard
+        icon={AlertTriangle}
+        danger
+        title={t("deleteAccount")}
+        description={t("permanentlyRemoveYourAccount")}
+      >
+        <div className="border-border bg-muted flex items-start gap-3 rounded-xl border p-4">
+          <span className="bg-card border-border text-muted-foreground flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border">
+            <AlertTriangle className="h-4 w-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-foreground text-sm font-semibold">{t("irreversible")}</p>
+            <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">
+              {t("allConversationsKnowledgeBase")}
+            </p>
+          </div>
+        </div>
+        <div className="mt-4">
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" size="sm">
+                {t("deleteMyAccount")}
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>{t("deleteYourAccount")}</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {t("yourConversationsKnowledgeBase")}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>{t("cancel2")}</AlertDialogCancel>
+                <AlertDialogAction
+                  disabled={deleting}
+                  onClick={handleDeleteAccount}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                >
+                  {deleting ? t("deleting") : t("yesDeleteMyAccount")}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </SectionCard>
+      <AssistantSettings />
+    </div>
+  );
+}

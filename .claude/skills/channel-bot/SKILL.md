@@ -1,0 +1,207 @@
+---
+name: channel-bot
+description: Work with messaging-channel bots — Telegram, Slack, Mattermost, Microsoft Teams, Discord or Matrix. Register a bot, route inbound messages through an agent, choose webhook vs polling, handle an @slug mention, or add a new channel adapter. Use when wiring chat into a messaging platform or debugging bot delivery, identity linking or "the bot answered as itself".
+---
+
+# Channels — Telegram, Slack, Mattermost, Teams, Discord, Matrix
+
+**Read `docs/channels.md`.** Code: `app/services/channels/` — a thick service with
+per-platform adapters plus a router that funnels inbound messages into the **same**
+agent pipeline as the web chat.
+
+| File | Responsibility |
+|---|---|
+| `base.py` | Shared adapter interface |
+| `telegram.py` | Telegram (aiogram v3) |
+| `slack.py` | Slack (Events API + Socket Mode) |
+| `mattermost.py` | Mattermost |
+| `imessage.py`, `imessage_transport.py` | Company BlueBubbles Mac: bounded HTTP, separately authenticated webhook, text/files, optional tapbacks and numbered prompts; no polling |
+| `teams.py`, `teams_auth.py` | Microsoft Teams over the Bot Connector's HTTP protocol (#1985): JWT-verified activities, Adaptive Cards, conversation references in `teams_conversations` |
+| `discord.py`, `discord_protocol.py` | Discord over its Gateway and REST API, no library (#2079); the protocol module holds the pure payloads, chunking and the channel-visibility arithmetic |
+| `matrix.py`, `matrix_protocol.py` | Matrix over the Client-Server API, no library (#2081): a `/sync` long-poll, threaded replies, `m.replace` edits, numbered prompts; the protocol module holds the pure content, mention and media rules. Unencrypted rooms only |
+| `ingress.py` | Durable normalized admission, per-thread queue and same-sender additions at model boundaries |
+| `reply_receipts.py` | Terminal reply snapshot and single submission fence; never replay model/tool effects |
+| `router.py` | Inbound platform message → conversation/session → agent run → reply |
+| `mentions.py` | `@slug` resolution, and the identity rules below |
+
+Bots live in the DB (`channel_bots`), with per-user identity (`channel_identity`) and
+per-thread session (`channel_session`).
+
+Native acknowledgement belongs after admission: Slack Socket Mode message events,
+`/agent` and message shortcuts await `ingress.admit_message`. Telegram's
+`_MessageAdmission` request middleware queues `getUpdates` results before the SDK
+can advance its offset; do not move persistence back into its detached message
+handler. Discord metadata requests stay off the Gateway receive loop, then await
+admission before routing. Prompt decisions keep their existing interaction path.
+
+## Surface prompts
+
+`formatting.house_style` supplies current defaults at run time. New binding rows
+store no snapshot. The editor shows `default_prompt` directly in the input.
+An explicit `prompt_replaces_defaults` edit replaces surface presentation text;
+legacy prompts remain additions. Clearing restores live defaults. Identity,
+authorization and environment context remain trusted runtime facts.
+Migration `0183_channel_prompt_defaults.py` removes exact historical defaults.
+Channel messages persist raw text and `channel_identity_id`; history author labels
+are resolved just before dispatch by `ChannelReference`, so erasure removes the
+labels as well. `build_message_history` carries opaque identity references;
+`PreparedRun.channel_authors` preserves per-user-part attribution across provider
+normalization and approval resumption. Completed-turn checkpoints also retain
+opaque per-user-part references, keyed by timestamp, without storing display labels. `ChannelReferencePart` marks reference-only
+parts omitted from run manifests. Screen editable reference values with the input
+policy, keeping fixed transport metadata out of question checks. Keep JSON envelopes out of `Message.content`.
+A decision made outside the chat (console, web chat, session API) continues the run through `app/services/channels/continuation.py`, and the endings made outside it (expiry, stop, a stranded run) post through `handback.post_notice`.
+Channel metadata remains request-only reference data, outside system instructions
+and the guarded input. Never infer identity or authorization from display labels.
+
+## Automatic participation
+
+`services/channels/observation.py` batches opted-in group messages through durable worker jobs. The binding owns the model, focus, channel scope and 20/1-minute intervals. It is off by default. Only native admitted human messages reach the bounded window; raw provider payloads and credentials never do. The tool-free decision and the main reply use the shared runner with source-agent budgets and guardrails. Main replies may use explicitly bound organization MCP accounts only, retaining allowlists, tool search and approvals. Never resolve personal or platform MCP credentials for an automatic turn. Refuse calls needing approval without parking; ask a participant to mention the bot for normal identity and approval handling. Re-check binding generation, bot admission fingerprint and active execution membership before model requests and delivery. Each paid window has a transactional, single-use claim; never replay uncertain replies.
+
+## Tokens go through the vault
+
+Bot tokens are sealed with `app/core/vault.py`, bound to the organization.
+**`CHANNEL_ENCRYPTION_KEY` and the deployment-wide Fernet key are gone**, removed
+before the chain was squashed into `0001_baseline`.
+`channel_bots.secret_key_version` exists because the token is now an envelope
+and a staged master-key rotation has to know which key sealed it. See the
+`vault-secrets` skill.
+
+## The mention invariants
+
+These are the ones worth testing and the ones easiest to break:
+
+- **A bot serves exactly one agent** - `uq_exposure_bot`, migration `0018`. So
+  `answer_default` takes the single active binding without asking what a second row
+  would have meant, and `@slug` is an alias for that agent rather than a router
+  between several. Binding a second agent is refused by the service *and* by the
+  database.
+- **`@slug` resolves only inside the bot's organization.** A slug from another org is
+  not found, not borrowed.
+- **A mention runs as the *sender*, never as the bot.** The bot's own identity would
+  carry whatever permissions it was registered with, which is how a channel becomes a
+  privilege-escalation path.
+- **An unlinked identity is refused, not run with no role.** "No role" is not a safe
+  default; it is an unauthenticated run.
+
+`tests/test_channel_mentions.py` and `tests/test_channel_bot_org_scope.py` pin these.
+
+## CLI
+
+```bash
+uv run agenticos cmd channel-add-bot \
+    --platform telegram --name "Support" --token <token> --mode jwt_linked
+uv run agenticos cmd channel-list-bots [--platform telegram]
+uv run agenticos cmd channel-test-message --bot-id <uuid> --chat-id <chat> --text ping
+uv run agenticos cmd channel-webhook-register --bot-id <uuid>
+uv run agenticos cmd channel-webhook-delete --bot-id <uuid>   # back to polling
+```
+
+There is no `cmd channel` group — the commands are flat, hyphenated names.
+
+Access modes: `open`, `whitelist`, `jwt_linked`, `group_only`. `jwt_linked` refuses
+an unlinked chat account everywhere on its own; `require_link` is the switch that
+makes the *other* modes refuse in a channel too (#639).
+
+## Webhook vs polling
+
+- **Polling (dev)** — the adapter long-polls; no public URL needed.
+- **Webhook (prod)** — the platform POSTs to a route under `api/routes/v1/`.
+  **Verify the signature or secret before processing anything** (HMAC for Telegram,
+  signing secret for Slack, the Bot Connector JWT for Teams - `TeamsAuth.verify`,
+  which needs the network and so is not `verify_webhook_signature`).
+- **Teams is push only** - there is nothing to poll, and a reply needs the
+  conversation's `serviceUrl`, which the route records on every activity.
+- **Discord is stream only** - everything, interactions included, arrives over
+  the bot's Gateway connection. `STREAM_ONLY` in `webhooks.py` makes the schema,
+  the service and `channel-webhook-register` refuse a webhook for it. An
+  interaction must be acknowledged within three seconds, so the adapter defers
+  first and does the work after.
+- **Matrix is stream only too** - a homeserver has no outgoing webhook; the bot
+  long-polls `/sync`. Its `next_batch` is kept in Redis per bot and account, and an
+  account's first sync skips the backlog. Room ids carry a colon, so the chat id is
+  `room_key(room_id)` (percent-encoded) and every adapter call decodes it with
+  `room_of` - never pass a raw room id to `split_thread`.
+
+## Adding an adapter
+
+1. Implement `services/channels/<platform>.py` against `base.py`: parse inbound into
+   the normalized message, send outbound.
+   Anything per bot the connection needs before it opens - a server address, an
+   app token - is registered in `prepare_connection`, the base hook the supervisor
+   calls on every adapter; do not add a differently named method for it.
+2. Wire it into `router.py` so inbound reaches the agent and replies stream back.
+   **Do not fork the agent pipeline** — one runner behind every surface is the whole
+   design.
+3. Add a signature-verified webhook route and/or a polling entrypoint. A polling
+   entrypoint runs its session under `supervise_stream` from `base.py` — the one
+   reconnect loop — and raises `ChannelNotConfigured` for anything a retry cannot
+   fix (a missing token or URL, a token the platform rejects); do not hand-roll a
+   `while True` with its own sleep.
+4. Reuse the existing conversation/session model.
+5. Respect the per-group/per-thread concurrency controls already in the adapters.
+
+## Where charts come from
+
+Two halves, and the split is the point. The `charts` capability
+(`app/agents/capabilities/charts/`) owns the **spec**: `create_chart` returns a
+`ChartSpec`, which the web chat renders with Recharts and a replay draws again.
+A chat platform can render neither, so `services/channels/chart_png.py` owns the
+**channel raster**: `mentions.drawn_chart` takes the turn's last chart call and
+`render_chart_png` rasterises it to a PNG the adapter attaches. `RENDERERS` there
+is one entry per `ChartType`, held equal to the capability's list by
+`tests/test_channel_charts.py` — a new type is added in both places or fails
+there. There is no `chart_render.py`; the file is `chart_png.py`.
+
+## Coverage
+
+`app/services/channels/mentions.py` is in the gated platform layer at 100%. The
+adapters are template-inherited and are not. See the `backend-tests` skill.
+
+
+## Discord server admission
+
+`AccessPolicy.discord_guild_ids` is the operator's persisted server allowlist.
+Empty means DM-only, including for a private bot already installed elsewhere.
+The service and the startup/catch-up pass forward these IDs through
+`open_inbound_stream` and `prepare_connection`; each edit reopens the stream.
+READY and GUILD_CREATE do not approve a server. Non-outage GUILD_DELETE forgets
+it, and join-specific check markers prevent a stale public-status result from
+releasing a re-added server. The router checks the persisted policy again.
+
+`/ask` defers privately before I/O, resolves its parent/thread key, and preflights
+access before posting a separate public question. A link invitation consumes the
+identity's rate limit before minting its bearer token. Console transcripts need
+both VIEW_CHANNEL and READ_MESSAGE_HISTORY. Keep signed CDN queries out of logs
+as well as request tracing.
+
+## Admission transaction
+
+`ChannelMessageRouter._route_inner` commits the admitted identity, session and conversation after access and rate-limit checks, before prompt resumption or run preparation. Platform MCP credentials are minted in an independent transaction and their provenance references the conversation. A flush alone leaves that foreign key target invisible. A failed admission commit must prevent preparation and credential minting.
+
+## Thread context and admission
+
+Ordinary native messages and webhooks enqueue `PROCESS_CHANNEL_MESSAGE` in the receiving transaction. Keep provider credentials and arbitrary raw envelopes out of its payload. Per-thread concurrency is enforced by the durable queue. Commands `status` and `stop` use the system pool to reach a running task; only its sender can control it.
+
+Automatic context is thread-only. `_sync_thread_context` imports a bounded page and later deltas, stores native receipts in `channel_message_sources`, and appends reference-only messages to the canonical transcript. Reuse `ConversationService.model_history` and its compaction; never rebuild the original transcript over an existing summary. A partial read must say what was omitted. `/new` advances the native cursor so it does not reload the conversation just reset.
+
+Personal service diagnostics report missing identity and connection separately. A personal source does not make a group destination private. Readiness is configuration-only, for the current caller; it must not refresh credentials or claim provider authorization was tested.
+
+Durable Mattermost edit admission checks the ignored-original Redis receipt once, then retains eligibility under a unique original-post edit key in PostgreSQL. Never re-check that expiring receipt after the thread queue wait. Resolve Telegram addressing before absorbing queued or in-process steering; slashless commands stay commands. Pending reply snapshots consume message retention quotas, and every terminal queue transition compacts duplicate reply bodies while keeping delivery identities and submission fences.
+
+
+## Matrix private destinations
+
+Matrix room keys are opaque: every native key retains the asserting homeserver; a private key retains the original recipient as well
+as the room, and the thread key retains the root. Pass the complete key through
+jobs, prompts, resumptions and file delivery; decode with `room_of` only at the
+Matrix API boundary. Never rebuild an outgoing private destination from the bare
+room ID. The adapter rechecks both original participants before sending private
+content, so a membership change cannot release a queued or resumed private reply
+into a group. Private and group turns use distinct conversation keys.
+
+Matrix identities and pending `/link` requests are keyed by canonical configured
+homeserver URL and native user ID. Always use `identity_scope(bot)` for identity
+queries, including backfill authors and prompt decisions. Retain the source
+server through durable ingress; reject old-server admission and resumptions after
+a bot changes endpoint. Show that URL before consent and on connected accounts.

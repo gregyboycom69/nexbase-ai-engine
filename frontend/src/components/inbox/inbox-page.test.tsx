@@ -1,0 +1,378 @@
+import type { ReactNode } from "react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { InboxPage } from "./inbox-page";
+import type { ToolApproval } from "@/types/runs";
+import type { Suggestion } from "@/lib/suggestions-api";
+
+/**
+ * The inbox (#2301): what waits, narrowed by where it came from, and what was
+ * already answered - with a declined one brought back.
+ */
+
+const state = vi.hoisted(() => ({
+  open: [] as Suggestion[],
+  loading: false,
+  error: null as Error | null,
+  refetch: vi.fn(),
+  history: [] as Suggestion[],
+  restore: vi.fn(),
+  shown: [] as Suggestion[],
+  filter: null as string | null,
+  push: vi.fn(),
+}));
+const toastSuccess = vi.hoisted(() => vi.fn());
+const toastError = vi.hoisted(() => vi.fn());
+
+vi.mock("@/hooks/use-suggestions", () => ({
+  useSuggestions: () => ({
+    suggestions: state.open,
+    isLoading: state.loading,
+    error: state.error,
+    refetch: state.refetch,
+  }),
+  useSuggestionHistory: () => ({
+    history: state.history,
+    restore: state.restore,
+    isLoading: state.loading,
+    error: state.error,
+    refetch: state.refetch,
+  }),
+}));
+const pending = vi.hoisted(() => ({
+  tools: [] as Pick<
+    ToolApproval,
+    | "id"
+    | "tool_id"
+    | "agent_name"
+    | "tool_args"
+    | "capability_tool_id"
+    | "context"
+    | "content_hidden"
+  >[],
+  steps: [] as { id: string; title: string; workflow_name: string }[],
+  count: 0,
+  isLoading: false,
+  error: null as Error | null,
+  refetch: vi.fn(),
+}));
+vi.mock("@/hooks/use-pending-approvals", () => ({ usePendingApprovals: () => pending }));
+vi.mock("@/components/assistant/your-suggestions", () => ({
+  YourSuggestions: () => <section aria-label="Personal suggestion preferences" />,
+}));
+vi.mock("./suggestion-rows", () => ({
+  SuggestionRows: ({ items }: { items: Suggestion[] }) => {
+    state.shown = items;
+    return <div data-testid="rows" />;
+  },
+}));
+vi.mock("@/hooks", () => ({ useMcpCatalog: () => ({ servers: [] }) }));
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(state.filter ? { filter: state.filter } : {}),
+  useRouter: () => ({ push: state.push }),
+  usePathname: () => "/inbox",
+}));
+vi.mock("@/components/dashboard/page-header", () => ({
+  PageHeader: ({ title, actions }: { title: string; actions?: ReactNode }) => (
+    <header>
+      <h1>{title}</h1>
+      {actions}
+    </header>
+  ),
+}));
+vi.mock("sonner", () => ({ toast: { success: toastSuccess, error: toastError } }));
+
+function item(id: string, overrides: Partial<Suggestion> = {}): Suggestion {
+  return {
+    id,
+    kind: "routine",
+    status: "open",
+    title: `Title ${id}`,
+    detail: null,
+    payload: {},
+    created_at: "2026-10-23T06:00:00Z",
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  pending.tools = [];
+  pending.steps = [];
+  pending.count = 0;
+  pending.isLoading = false;
+  pending.error = null;
+  pending.refetch.mockReset();
+  state.open = [];
+  state.loading = false;
+  state.error = null;
+  state.refetch.mockReset();
+  state.history = [];
+  state.shown = [];
+  state.filter = null;
+  state.push.mockReset();
+  state.restore.mockReset().mockResolvedValue(undefined);
+  toastSuccess.mockReset();
+  toastError.mockReset();
+});
+
+describe("InboxPage", () => {
+  it("narrows what waits to the urgent, the watches' or the suggestions", async () => {
+    const finding = item("f", { kind: "finding" });
+    const urgent = item("u", { kind: "finding", urgent: true });
+    const routine = item("r");
+    state.open = [finding, urgent, routine];
+    render(<InboxPage />);
+
+    expect(screen.getByRole("heading", { name: "Inbox" })).toBeInTheDocument();
+    expect(screen.getByText("3 waiting")).toBeInTheDocument();
+    expect(state.shown).toEqual([finding, urgent, routine]);
+    await chooseFilter("Urgent");
+    expect(state.shown).toEqual([urgent]);
+    await chooseFilter("Routine results");
+    expect(state.shown).toEqual([finding, urgent]);
+    await chooseFilter("Suggestions");
+    expect(state.shown).toEqual([routine]);
+    await chooseFilter("All");
+    expect(state.shown).toEqual([finding, urgent, routine]);
+  });
+
+  it("says nothing waits, and sends the person to set up a watch", async () => {
+    render(<InboxPage />);
+    expect(screen.getByText("Nothing waits here")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Set up a routine" }));
+    expect(state.push).toHaveBeenCalledWith("/routines");
+
+    // Nothing urgent is not a reason to set up a watch.
+    await chooseFilter("Urgent");
+    expect(screen.queryByRole("button", { name: "Set up a routine" })).toBeNull();
+  });
+
+  it("opens already narrowed to what a link asked for, and ignores what it does not know", () => {
+    state.open = [item("f", { kind: "finding" }), item("r")];
+    state.filter = "watches";
+    const { unmount } = render(<InboxPage />);
+    expect(screen.getByRole("combobox", { name: "Show" })).toHaveTextContent("Routine results");
+    expect(state.shown.map((each) => each.id)).toEqual(["f"]);
+    unmount();
+
+    state.filter = "spam";
+    render(<InboxPage />);
+    expect(screen.getByRole("combobox", { name: "Show" })).toHaveTextContent("All");
+  });
+
+  it("lists what was answered and brings a declined one back", async () => {
+    state.history = [
+      item("open"),
+      item("took", { status: "accepted", detail: "Saved" }),
+      item("no", { status: "dismissed" }),
+    ];
+    render(<InboxPage />);
+    await chooseFilter("Done");
+
+    expect(screen.queryByText("Title open")).toBeNull();
+    expect(screen.getByText("Saved")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Bring back" }));
+    expect(state.restore).toHaveBeenCalledWith("no");
+    await waitFor(() => expect(toastSuccess).toHaveBeenCalled());
+  });
+
+  it("toasts a restore the server refused, and says when nothing was answered", async () => {
+    state.history = [item("no", { status: "dismissed" })];
+    state.restore.mockRejectedValue(new Error("Server down"));
+    const { unmount } = render(<InboxPage />);
+    await chooseFilter("Done");
+    await userEvent.click(screen.getByRole("button", { name: "Bring back" }));
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    unmount();
+
+    state.history = [];
+    render(<InboxPage />);
+    await chooseFilter("Done");
+    expect(screen.getByText("Nothing answered yet")).toBeInTheDocument();
+  });
+});
+
+it("does not announce an empty inbox while its data is still loading", () => {
+  state.loading = true;
+  render(<InboxPage />);
+  expect(screen.queryByText("Nothing waits here")).not.toBeInTheDocument();
+  expect(screen.queryByText("Nothing waiting")).not.toBeInTheDocument();
+});
+
+it("shows a retry for a failed read instead of claiming nothing waits", async () => {
+  state.error = new Error("offline");
+  render(<InboxPage />);
+  expect(screen.queryByText("Nothing waits here")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(state.refetch).toHaveBeenCalledOnce();
+});
+
+it("applies a watch-filter link while the inbox is already open", () => {
+  const finding = item("finding", { kind: "finding" });
+  state.open = [finding, item("routine")];
+  const { rerender } = render(<InboxPage />);
+  state.filter = "watches";
+  rerender(<InboxPage />);
+  expect(state.shown).toEqual([finding]);
+});
+
+it("lets the person retry a failed Done history read", async () => {
+  state.error = new Error("offline");
+  render(<InboxPage />);
+  await chooseFilter("Done");
+  await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+  expect(state.refetch).toHaveBeenCalledOnce();
+});
+
+it("keeps Done history in a loading state until its read finishes", () => {
+  state.filter = "done";
+  state.loading = true;
+  const { rerender } = render(<InboxPage />);
+  expect(screen.queryByText("Nothing answered yet")).not.toBeInTheDocument();
+  state.loading = false;
+  state.history = [item("done", { status: "accepted" })];
+  rerender(<InboxPage />);
+  expect(screen.getByText("Title done")).toBeInTheDocument();
+});
+
+async function chooseFilter(name: string) {
+  await userEvent.click(screen.getByRole("combobox", { name: "Show" }));
+  await userEvent.click(screen.getByRole("option", { name }));
+}
+
+it("changes the desktop filters without opening a duplicate select", async () => {
+  render(<InboxPage />);
+  await userEvent.click(screen.getByRole("button", { name: "Urgent" }));
+  expect(screen.getByRole("button", { name: "Urgent" })).toHaveAttribute("aria-pressed", "true");
+  await userEvent.click(screen.getByRole("button", { name: "All" }));
+  expect(screen.getByRole("button", { name: "All" })).toHaveAttribute("aria-pressed", "true");
+});
+
+describe("approvals waiting on the reader", () => {
+  beforeEach(() => {
+    pending.steps = [{ id: "s1", title: "Send the refund?", workflow_name: "Refunds" }];
+    pending.tools = [
+      {
+        id: "t1",
+        tool_id: "send_email",
+        agent_name: "Support",
+        tool_args: { subject: "Confirm the delivery date" },
+      },
+      { id: "t2", tool_id: "create_lead", agent_name: null, tool_args: {} },
+    ];
+    pending.count = 2;
+  });
+
+  it("leads the inbox, counted with everything else, and leads to the approvals queue", () => {
+    render(<InboxPage />);
+
+    const section = screen.getByRole("region", { name: "Approval requests" });
+    expect(section).toHaveTextContent("Send the refund?");
+    expect(section).toHaveTextContent("Workflow Refunds");
+    expect(section).toHaveTextContent("Confirm the delivery date");
+    expect(section).toHaveTextContent("Send email");
+    expect(section).not.toHaveTextContent("send_email");
+    expect(section).toHaveTextContent("Create lead");
+    expect(section.closest("[data-list-layout]")).not.toHaveClass("flex-1");
+    expect(section).toHaveTextContent("Agent Support");
+    // A call whose agent the queue could not name still says where it came from.
+    expect(section).toHaveTextContent("An agent");
+    expect(screen.getByRole("link", { name: "Open approvals" })).toHaveAttribute(
+      "href",
+      "/runs?tab=approvals",
+    );
+    expect(screen.getByText("2 waiting")).toBeInTheDocument();
+    // Something waits, so the inbox does not say nothing does.
+    expect(screen.queryByText("Nothing waits here")).toBeNull();
+  });
+
+  it("uses the stable action context and does not preview hidden arguments", () => {
+    pending.tools = [
+      {
+        id: "t1",
+        tool_id: "renamed_write",
+        capability_tool_id: "create_record",
+        context: { table: "Delivery exceptions" },
+        tool_args: { title: "Express shipping" },
+      },
+      {
+        id: "t2",
+        tool_id: "share_memory",
+        tool_args: { text: "Private run content" },
+        content_hidden: true,
+      },
+    ];
+    render(<InboxPage />);
+    const section = screen.getByRole("region", { name: "Approval requests" });
+    expect(section).toHaveTextContent("Delivery exceptions");
+    expect(section).not.toHaveTextContent("Private run content");
+  });
+
+  it("keeps the preview bounded and leaves every request reachable in the queue", () => {
+    pending.steps = Array.from({ length: 7 }, (_, index) => ({
+      id: `s${index}`,
+      title: `Decision ${index}`,
+      workflow_name: "Deliveries",
+    }));
+    pending.tools = [];
+    pending.count = 7;
+    render(<InboxPage />);
+    const section = screen.getByRole("region", { name: "Approval requests" });
+    expect(section.querySelectorAll("li")).toHaveLength(5);
+    expect(screen.queryByText("Decision 5")).toBeNull();
+    expect(screen.getByRole("link", { name: "Open approvals" })).toHaveAttribute(
+      "href",
+      "/runs?tab=approvals",
+    );
+    expect(screen.getByText("7 waiting")).toBeInTheDocument();
+  });
+
+  it("stays among the urgent items and out of routine results", () => {
+    state.filter = "urgent";
+    const { unmount } = render(<InboxPage />);
+    expect(screen.getByRole("region", { name: "Approval requests" })).toBeInTheDocument();
+    unmount();
+
+    state.filter = "watches";
+    render(<InboxPage />);
+    expect(screen.queryByRole("region", { name: "Approval requests" })).toBeNull();
+    expect(screen.getByText("Nothing waits here")).toBeInTheDocument();
+  });
+
+  it("claims no count and no empty inbox while the approvals are still read", () => {
+    pending.isLoading = true;
+    render(<InboxPage />);
+    expect(screen.queryByText("Nothing waits here")).toBeNull();
+    expect(screen.queryByText(/waiting/)).toBeNull();
+    expect(screen.queryByRole("region", { name: "Approval requests" })).toBeNull();
+  });
+
+  it("offers a retry of both reads when the approvals could not be read", async () => {
+    pending.error = new Error("offline");
+    render(<InboxPage />);
+    expect(screen.queryByText("Nothing waits here")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Approval requests" })).toBeNull();
+    expect(screen.getByText("—")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(pending.refetch).toHaveBeenCalledOnce();
+    expect(state.refetch).toHaveBeenCalledOnce();
+  });
+
+  it("shows nothing of the kind to a reader nothing waits on", () => {
+    pending.steps = [];
+    pending.tools = [];
+    pending.count = 0;
+    render(<InboxPage />);
+    expect(screen.queryByRole("region", { name: "Approval requests" })).toBeNull();
+    expect(screen.getByText("Nothing waits here")).toBeInTheDocument();
+  });
+});
+
+it("opens personal delivery preferences from Inbox without a second history view", async () => {
+  render(<InboxPage />);
+  await userEvent.click(screen.getByRole("button", { name: "Inbox preferences" }));
+  expect(screen.getByRole("dialog", { name: "Inbox preferences" })).toBeVisible();
+  expect(screen.getByRole("region", { name: "Personal suggestion preferences" })).toBeVisible();
+});

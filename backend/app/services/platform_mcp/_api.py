@@ -1,0 +1,98 @@
+"""The public API, called in-process with the caller's own token.
+
+An operation is a call to a route of the public API rather than a second path
+into the services, so it is held to everything a key is held to over HTTP - the
+public-route check, the key's scopes and its issuer's current role, resource
+grants, budgets, rate limits and the audit trail - and cannot drift from it.
+
+The MCP server is its caller, and the token is the one the MCP request arrived
+with - a key, an OAuth access token, or the credential the runner minted for the
+person an AI Architect run acts for. How a refusal is answered is a parameter:
+the server sends an MCP client a tool error carrying the API's own reason.
+"""
+
+from collections.abc import Callable
+from hashlib import sha256
+from typing import Any
+
+import httpx
+from pydantic import JsonValue, TypeAdapter
+from starlette.types import ASGIApp
+
+from app.core.config import settings
+from app.services.platform_mcp._disclosure import error_envelope
+
+_DETAIL = TypeAdapter(dict[str, JsonValue])
+
+_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+"""A run can take minutes; nothing here leaves the process, so connect is instant."""
+
+Refusal = Callable[[str], dict[str, Any]]
+"""How a refused call is answered: raise, or return what the caller should see."""
+
+_NOT_EMPTY = (
+    "This call failed; it is not an empty result, so never report it as none. "
+    "Verify the id with the matching listing tool before retrying. A 404 can "
+    "also mean this caller cannot read that resource; never bypass its permissions."
+)
+"""Said with a refusal a model might otherwise read as "nothing found"."""
+
+
+class PlatformApi:
+    def __init__(
+        self, app: ASGIApp, *, token: Callable[[], str | None], on_refusal: Refusal
+    ) -> None:
+        self._transport: httpx.AsyncBaseTransport = httpx.ASGITransport(app=app)
+        self._token = token
+        self._on_refusal = on_refusal
+
+    def credential_id(self) -> str | None:
+        """Bind read continuations to this exact credential without exposing it."""
+        token = self._token()
+        return sha256(token.encode()).hexdigest() if token is not None else None
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Any = None,
+        params: dict[str, Any] | None = None,
+        files: dict[str, tuple[str, bytes, str]] | None = None,
+    ) -> Any:
+        """One public API call as the caller; a refusal goes to `on_refusal`.
+
+        The refusal carries the API's own message - written in this repository,
+        for whoever made the request - and its status and code.
+        """
+        token = self._token()
+        if token is None:
+            return self._on_refusal("This tool needs an authenticated caller")
+        async with httpx.AsyncClient(
+            transport=self._transport,
+            base_url=f"http://agenticos{settings.API_V1_STR}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=_TIMEOUT,
+        ) as client:
+            response = await client.request(method, path, json=json, params=params, files=files)
+        if response.status_code == 204:
+            return None
+        body = response.json()
+        if response.is_error:
+            error = body.get("error", {}) if isinstance(body, dict) else {}
+            if response.status_code < 500:
+                detail: dict[str, Any] = {
+                    "status": response.status_code,
+                    "code": error.get("code", "ERROR"),
+                    "message": error.get("message", "The request was refused"),
+                    "details": error.get("details", {}),
+                }
+                if response.status_code in (404, 422):
+                    detail["hint"] = _NOT_EMPTY
+                return self._on_refusal(error_envelope(_DETAIL.validate_python(detail)))
+            return self._on_refusal("The platform request failed; check its server log")
+        return body
+
+    def refuse(self, message: str) -> Any:
+        """Refuse a call the way the API's own refusals are answered."""
+        return self._on_refusal(message)

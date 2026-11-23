@@ -1,0 +1,301 @@
+"""The self-service memory surface, wired (#1594).
+
+What the service decides is in `tests/test_memory_self_service.py`. What is here
+is the wiring: which path, which caller the service is handed, and that a refusal
+reaches the browser as a refusal.
+"""
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.api import deps
+from app.core.config import settings
+from app.core.exceptions import AuthorizationError
+from app.core.permissions import AuthContext, OrgRoleName
+from app.main import app
+from app.schemas.memory import (
+    MemoryClaimDetail,
+    MemoryClaimList,
+    MemoryClaimRead,
+    MemoryErasureResult,
+    MemoryNoteList,
+    MemoryNoteRead,
+)
+
+pytestmark = [pytest.mark.anyio, pytest.mark.security]
+
+ROOT = f"{settings.API_V1_STR}/memory"
+PERSON = uuid4()
+ORG = uuid4()
+NOTE = uuid4()
+
+_NOTE = MemoryNoteRead(
+    id=NOTE,
+    agent_id=uuid4(),
+    agent_name="Support",
+    name="prefs",
+    content="Prefers short answers",
+    format="md",
+    kind="note",
+)
+_PAGE = MemoryNoteList(items=[_NOTE], total=1)
+
+
+@asynccontextmanager
+async def _client(*, app_admin: bool = False) -> AsyncIterator[AsyncClient]:
+    ctx = AuthContext(
+        user_id=PERSON, organization_id=ORG, role=OrgRoleName.VIEWER, is_app_admin=app_admin
+    )
+    app.dependency_overrides[deps.get_auth_context] = lambda: ctx
+    app.dependency_overrides[deps.get_db_session] = lambda: MagicMock()
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_a_member_reads_their_own_store() -> None:
+    """No permission to ask for: the answer is the same for a Viewer and an Owner."""
+    with patch("app.services.memory.MemoryService.mine", new=AsyncMock(return_value=_PAGE)):
+        async with _client() as client:
+            response = await client.get(f"{ROOT}/mine")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"][0]["agent_name"] == "Support"
+
+
+async def test_the_window_the_caller_asked_for_reaches_the_service() -> None:
+    mine = AsyncMock(return_value=_PAGE)
+    with patch("app.services.memory.MemoryService.mine", mine):
+        async with _client() as client:
+            await client.get(f"{ROOT}/mine?skip=40&limit=20")
+
+    assert (mine.await_args.kwargs["skip"], mine.await_args.kwargs["limit"]) == (40, 20)
+
+
+async def test_suppressing_a_note_goes_through_as_inactive() -> None:
+    set_active = AsyncMock(return_value=_NOTE)
+    with patch("app.services.memory.MemoryService.set_active", set_active):
+        async with _client() as client:
+            response = await client.patch(f"{ROOT}/mine/{NOTE}", json={"active": False})
+
+    assert response.status_code == 200
+    assert set_active.await_args.kwargs["active"] is False
+
+
+async def test_deleting_a_note_answers_no_content() -> None:
+    with patch("app.services.memory.MemoryService.delete_note", new=AsyncMock()):
+        async with _client() as client:
+            response = await client.delete(f"{ROOT}/mine/{NOTE}")
+
+    assert response.status_code == 204
+
+
+async def test_an_app_admin_names_the_tenant_and_the_reason() -> None:
+    """The tenant is a parameter rather than whichever the admin had selected: a
+    read that used the active organization silently is one nobody could audit."""
+    for_person = AsyncMock(return_value=_PAGE)
+    with patch("app.services.memory.MemoryService.for_person", for_person):
+        async with _client(app_admin=True) as client:
+            response = await client.get(
+                f"{ROOT}/person/{PERSON}?organization_id={ORG}&reason=DSAR+41"
+            )
+
+    assert response.status_code == 200
+    assert for_person.await_args.kwargs["reason"] == "DSAR 41"
+    assert for_person.await_args.args[1] == ORG
+
+
+async def test_an_organization_role_is_refused_rather_than_500() -> None:
+    with patch(
+        "app.services.memory.MemoryService.for_person",
+        new=AsyncMock(side_effect=AuthorizationError(message="nope")),
+    ):
+        async with _client() as client:
+            response = await client.get(f"{ROOT}/person/{PERSON}?organization_id={ORG}")
+
+    assert response.status_code == 403
+
+
+async def test_forgetting_a_person_answers_what_was_removed() -> None:
+    """Not 204: a caller has to be able to say how much was actually erased."""
+    result = MemoryErasureResult(notes_deleted=3)
+    with patch(
+        "app.services.memory.MemoryService.forget_person", new=AsyncMock(return_value=result)
+    ):
+        async with _client() as client:
+            response = await client.delete(f"{ROOT}/person/{PERSON}")
+
+    assert response.status_code == 200
+    assert response.json() == {"notes_deleted": 3, "claims_deleted": 0}
+
+
+async def test_clearing_one_agents_store_names_the_agent_in_the_query() -> None:
+    """A memory store nobody can clear is a liability (#788)."""
+    agent_id = uuid4()
+    clear = AsyncMock(return_value=MemoryErasureResult(notes_deleted=2))
+    with patch("app.services.memory.MemoryService.clear_agent", clear):
+        async with _client() as client:
+            response = await client.delete(f"{ROOT}?agent_id={agent_id}")
+
+    assert response.status_code == 200
+    assert clear.await_args.args[1] == agent_id
+
+
+_CLAIM_ID = uuid4()
+_CLAIM = {
+    "id": _CLAIM_ID,
+    "statement": "Prefers short answers",
+    "kind": "preference",
+    "origin": "agent",
+    "status": "current",
+    "observed_at": "2026-11-01T10:00:00Z",
+}
+
+
+async def test_a_person_lists_their_claims_and_may_ask_for_the_history() -> None:
+    listed = AsyncMock(return_value=MemoryClaimList(items=[MemoryClaimRead(**_CLAIM)], total=1))
+    with patch("app.services.memory.MemoryService.my_claims", new=listed):
+        async with _client() as client:
+            response = await client.get(f"{ROOT}/claims/mine?history=true&limit=10")
+
+    assert response.status_code == 200
+    assert response.json()["items"][0]["statement"] == "Prefers short answers"
+    assert listed.await_args.kwargs == {
+        "skip": 0,
+        "limit": 10,
+        "history": True,
+        "q": "",
+        "kind": None,
+        "scope": None,
+    }
+
+
+async def test_a_claim_is_read_with_its_ancestry() -> None:
+    detail = MemoryClaimDetail(**_CLAIM, withheld=2)
+    with patch(
+        "app.services.memory.MemoryService.claim_detail", new=AsyncMock(return_value=detail)
+    ):
+        async with _client() as client:
+            response = await client.get(f"{ROOT}/claims/mine/{_CLAIM_ID}")
+
+    assert response.status_code == 200 and response.json()["withheld"] == 2
+
+
+async def test_a_correction_and_a_retraction_reach_the_service_as_the_caller() -> None:
+    corrected = AsyncMock(return_value=MemoryClaimRead(**_CLAIM))
+    retracted = AsyncMock(return_value=MemoryClaimRead(**_CLAIM))
+    with (
+        patch("app.services.memory.MemoryService.correct_claim", new=corrected),
+        patch("app.services.memory.MemoryService.retract_claim", new=retracted),
+    ):
+        async with _client() as client:
+            fixed = await client.post(
+                f"{ROOT}/claims/mine/{_CLAIM_ID}/correct",
+                json={"statement": "Prefers long answers"},
+            )
+            gone = await client.post(f"{ROOT}/claims/mine/{_CLAIM_ID}/retract")
+            empty = await client.post(
+                f"{ROOT}/claims/mine/{_CLAIM_ID}/correct", json={"statement": ""}
+            )
+
+    assert fixed.status_code == 200 and gone.status_code == 200 and empty.status_code == 422
+    assert corrected.await_args.args[1] == _CLAIM_ID
+    assert corrected.await_args.args[2].statement == "Prefers long answers"
+    assert retracted.await_args.args[1] == _CLAIM_ID
+
+
+async def test_browser_filters_reach_the_owned_memory_service() -> None:
+    listed = AsyncMock(return_value=MemoryClaimList(items=[], total=0))
+    with patch("app.services.memory.MemoryService.my_claims", new=listed):
+        async with _client() as client:
+            response = await client.get(
+                f"{ROOT}/claims/mine?q=invoice&kind=decision&scope=agent&skip=100"
+            )
+    assert response.status_code == 200
+    assert listed.await_args.kwargs == {
+        "skip": 100,
+        "limit": 50,
+        "history": False,
+        "q": "invoice",
+        "kind": "decision",
+        "scope": "agent",
+    }
+
+
+@pytest.mark.parametrize("query", ["kind=unknown", "scope=organization", "q=" + "x" * 201])
+async def test_browser_filter_contract_refuses_invalid_input(query: str) -> None:
+    listed = AsyncMock(return_value=MemoryClaimList(items=[], total=0))
+    with patch("app.services.memory.MemoryService.my_claims", new=listed):
+        async with _client() as client:
+            response = await client.get(f"{ROOT}/claims/mine?{query}")
+    assert response.status_code == 422
+    listed.assert_not_awaited()
+
+
+async def test_only_the_reviewed_personal_decision_fields_leave_memory():
+    from datetime import UTC, datetime
+
+    from app.schemas.dataset import DatasetCaseRead
+
+    dataset_id = uuid4()
+    prepared = AsyncMock(
+        return_value=DatasetCaseRead(
+            id=uuid4(),
+            case_id=uuid4(),
+            source="manual",
+            input="A delayed shipment",
+            reference_answer="Ask for a confirmed date",
+            tags=["decision-episode"],
+            created_at=datetime.now(UTC),
+        )
+    )
+    review = {
+        "dataset_id": str(dataset_id),
+        "input": "A delayed shipment",
+        "reference_answer": "Ask for a confirmed date",
+    }
+    with patch("app.services.memory.MemoryService.improve_case", new=prepared):
+        async with _client() as client:
+            response = await client.post(
+                f"{ROOT}/claims/mine/{_CLAIM_ID}/improve-case", json={"confirmed": True, **review}
+            )
+            unconfirmed = await client.post(
+                f"{ROOT}/claims/mine/{_CLAIM_ID}/improve-case", json={"confirmed": False, **review}
+            )
+            nowhere = await client.post(
+                f"{ROOT}/claims/mine/{_CLAIM_ID}/improve-case",
+                json={
+                    "confirmed": True,
+                    "input": "A delayed shipment",
+                    "reference_answer": "Ask for a confirmed date",
+                },
+            )
+    assert response.status_code == 201
+    assert response.json()["reference_answer"] == "Ask for a confirmed date"
+    assert unconfirmed.status_code == 422
+    assert nowhere.status_code == 422
+    assert prepared.await_args.args[2].dataset_id == dataset_id
+    assert prepared.await_args.args[0].user_id == PERSON
+    assert prepared.await_args.args[1] == _CLAIM_ID
+    prepared.assert_awaited_once()
+
+
+async def test_personal_note_correction_keeps_revision_and_content() -> None:
+    edit = AsyncMock(return_value=_NOTE)
+    with patch("app.services.memory.MemoryService.edit_note", edit):
+        async with _client() as client:
+            response = await client.patch(
+                f"{ROOT}/mine/{NOTE}/content",
+                json={"content": "Corrected", "expected_updated_at": None},
+            )
+    assert response.status_code == 200
+    assert edit.await_args.args[2].content == "Corrected"
+    assert edit.await_args.args[2].expected_updated_at is None

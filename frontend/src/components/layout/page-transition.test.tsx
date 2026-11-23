@@ -1,0 +1,114 @@
+import { fireEvent, render } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+import { PageTransition } from "./page-transition";
+import { PAGE_CLEARANCE } from "@/lib/page-clearance";
+
+let pathname = "/";
+vi.mock("next/navigation", () => ({
+  usePathname: () => pathname,
+}));
+
+function rootClasses(path: string): string {
+  pathname = path;
+  const { container } = render(
+    <PageTransition>
+      <div />
+    </PageTransition>,
+  );
+  return (container.firstElementChild as HTMLElement).className;
+}
+
+describe("the page transition wrapper", () => {
+  it("preserves the shared layout DOM and unsaved input when the path changes", () => {
+    pathname = "/settings/profile";
+    const view = render(
+      <PageTransition>
+        <input aria-label="Draft" defaultValue="Saved" />
+      </PageTransition>,
+    );
+    const frame = view.container.firstElementChild;
+    const input = view.getByRole("textbox");
+    fireEvent.change(input, { target: { value: "Still writing" } });
+    pathname = "/settings/account";
+    view.rerender(
+      <PageTransition>
+        <input aria-label="Draft" defaultValue="Saved" />
+      </PageTransition>,
+    );
+    expect(view.container.firstElementChild).toBe(frame);
+    expect(view.getByRole("textbox")).toBe(input);
+    expect(input).toHaveValue("Still writing");
+  });
+
+  it("constrains its height on the chat route so only the message pane scrolls", () => {
+    // A flex item's min-height:0 is a floor, not a ceiling: without min-h-0
+    // on THIS box, the transcript's min-content height propagates up and the
+    // whole page scrolls instead of the chat window.
+    expect(rootClasses("/en/chat")).toContain("min-h-0");
+  });
+
+  it("constrains the workflow editor, whose palette and panel scroll in their own panes", () => {
+    expect(rootClasses("/en/workflows/wf-1")).toContain("min-h-0");
+    expect(rootClasses("/en/workflows/wf-1")).not.toContain(PAGE_CLEARANCE);
+    // Its runs are an ordinary page, and so is the list.
+    expect(rootClasses("/en/workflows/wf-1/runs")).not.toContain("min-h-0");
+    expect(rootClasses("/en/workflows")).not.toContain("min-h-0");
+  });
+
+  it.each(["/workflows/runs", "/pl/workflows/wf-1/runs", "/en/workflows/wf-1/runs/run-1"])(
+    "keeps workflow run content clear of floating controls: %s",
+    (path) => {
+      expect(rootClasses(path)).toContain(PAGE_CLEARANCE);
+      expect(rootClasses(path)).not.toContain("min-h-0");
+    },
+  );
+
+  it("leaves long pages unconstrained so the room under them lands after the content", () => {
+    expect(rootClasses("/en/agents")).not.toContain("min-h-0");
+  });
+
+  it("declares the room under a page here, where it is painted", () => {
+    // Not on `main`, though `main` is what scrolls: `DeploymentGate` wraps this
+    // in a `min-h-0 flex-1` box, so a long page overflows that box and `main`'s
+    // padding edge stays where the shorter box ended - 0px below the last card
+    // at every width, measured in Chromium 151 and WebKit 26.5 (#933). This box
+    // grows with its content, so padding here lands after the last element.
+    expect(rootClasses("/en/agents")).toContain(PAGE_CLEARANCE);
+  });
+
+  it("counts the safe-area inset rather than assuming it away", () => {
+    // Moving the launcher into the header does not remove the home indicator inset.
+    expect(PAGE_CLEARANCE).toContain("var(--safe-bottom)");
+  });
+
+  it("leaves the chat without it, so the composer sits on the bottom edge", () => {
+    // Room under a fixed control is a gap under it.
+    expect(rootClasses("/en/chat")).not.toContain("pb-");
+  });
+
+  it("constrains Activity so the history and inspector fill the viewport", () => {
+    expect(rootClasses("/en/runs")).toContain("min-h-0");
+    expect(rootClasses("/en/runs")).not.toContain("pb-");
+  });
+
+  it("does not mistake a route that merely starts with a constrained one", () => {
+    expect(rootClasses("/en/chatty")).not.toContain("min-h-0");
+    expect(rootClasses("/en/runsomething")).not.toContain("min-h-0");
+    // And it gets the room, which the prefix match would have taken away.
+    expect(rootClasses("/en/runsomething")).toContain(PAGE_CLEARANCE);
+  });
+});
+
+it("bounds paged admin lists without constraining organization detail pages", () => {
+  expect(rootClasses("/en/admin/users")).toContain("min-h-0");
+  expect(rootClasses("/pl/admin/organizations")).toContain("min-h-0");
+  expect(rootClasses("/en/admin/organizations/org-id")).not.toContain("min-h-0");
+});
+
+it("bounds the permission matrix while keeping other organization forms scrollable", () => {
+  expect(rootClasses("/orgs/org-id/roles")).toContain("min-h-0");
+  expect(rootClasses("/pl/orgs/org-id/roles")).toContain("min-h-0");
+  expect(rootClasses("/orgs/org-id/retention")).not.toContain("min-h-0");
+  expect(rootClasses("/orgs/org-id/directory")).not.toContain("min-h-0");
+});

@@ -1,0 +1,68 @@
+"use client";
+
+import { usePathname } from "next/navigation";
+
+import { stripLocale } from "@/lib/active-route";
+import { directionFor } from "@/lib/navigation-direction";
+import { PAGE_CLEARANCE } from "@/lib/page-clearance";
+import { cn } from "@/lib/utils";
+
+/**
+ * Routes that scroll inside their own panes, not in `main`.
+ *
+ * `min-h-0` is what stops this box growing with its content, so the pane below
+ * it scrolls instead of the page. Chat needs the constrained chain: a flex
+ * item's `min-height: 0` is a floor, not a ceiling, so the chat page setting it
+ * on its own root does NOT stop this box's min-content from growing to the
+ * transcript's height. The workflow editor needs it for the same reason: its
+ * palette and property panel scroll inside a workspace that fills the window.
+ */
+const OWN_SCROLL_PANE =
+  /\/(?:chat|runs|projects\/[^/]+)(?:\/|$)|\/admin\/(?:users|organizations)\/?$|\/workflows\/[^/]+$|\/orgs\/[^/]+\/roles\/?$/;
+
+/**
+ * Routes that place their own room under themselves, lower down.
+ *
+ * Two routes, for two different reasons, and both are about something that has
+ * to reach the bottom edge of the viewport:
+ *
+ * - **`/chat`**, whose composer belongs on that edge. Room beneath a fixed
+ *   control is a gap under it, so the page takes none at all.
+ * - **`/workflows/<id>`**, the editor, whose workspace ends at that edge with
+ *   its own margin.
+ * - **`/runs`**, whose history and inspector fill the available viewport.
+ *   Activity owns the bottom margin around both independently scrolling panes.
+ */
+const OWN_BOTTOM_ROOM = /\/(?:chat|runs|projects\/[^/]+)(?:\/|$)|\/workflows\/[^/]+$/;
+
+// Keep shared layouts mounted: keying the frame by pathname also reset their
+// forms, scroll positions and queries, even when only a sibling tab changed.
+export function PageTransition({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const workflowRunPage = /^\/workflows\/(?:runs|[^/]+\/runs(?:\/[^/]+)?)\/?$/.test(
+    stripLocale(pathname),
+  );
+  // The phone app slides a page in from the side it came from (`desktop.css`);
+  // everywhere else the attribute changes nothing.
+  const direction = directionFor(pathname);
+
+  return (
+    // Everywhere else the room under a page is declared here, and this is the
+    // one place it paints: `main` scrolls, but `main` is not where its own
+    // bottom padding lands - `DeploymentGate` wraps this in a `min-h-0 flex-1`
+    // box, so a long page overflows that box and `main`'s padding edge stays
+    // where the shorter box ended, buried mid-content and measured at 0px below
+    // the last card at every width (#933). This box grows with its content, so
+    // padding here is painted after the last element.
+    <div
+      data-direction={direction}
+      className={cn(
+        "page-enter flex flex-1 flex-col",
+        OWN_SCROLL_PANE.test(pathname) && !workflowRunPage && "min-h-0",
+        (!OWN_BOTTOM_ROOM.test(pathname) || workflowRunPage) && PAGE_CLEARANCE,
+      )}
+    >
+      {children}
+    </div>
+  );
+}

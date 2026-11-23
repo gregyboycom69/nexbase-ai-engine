@@ -1,0 +1,55 @@
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { expect, it } from "vitest";
+import { SectionCard, SettingsSection } from "./settings-section";
+
+it("keeps destructive-action warnings visible before any help is opened", () => {
+  render(
+    <SettingsSection
+      title="Delete account"
+      description="This permanently removes your data."
+      danger
+    >
+      <button>Delete</button>
+    </SettingsSection>,
+  );
+  expect(screen.getByText("This permanently removes your data.")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "More information" })).not.toBeInTheDocument();
+});
+
+it("offers contextual guidance in organization settings without hiding fields", async () => {
+  render(
+    <SettingsSection title="Preferences" description="How these settings work">
+      <label>
+        Required name
+        <input required />
+      </label>
+    </SettingsSection>,
+  );
+  expect(screen.getByLabelText("Required name")).toBeVisible();
+  expect(screen.queryByText("How these settings work")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "More information" }));
+  expect(await screen.findByText("How these settings work")).toBeVisible();
+});
+
+it("keeps personal settings guidance on demand with the action visible", async () => {
+  render(
+    <SectionCard title="Security" description="Manage your sessions">
+      <button>Manage</button>
+    </SectionCard>,
+  );
+  expect(screen.queryByText("Manage your sessions")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Manage" })).toBeVisible();
+  await userEvent.click(screen.getByRole("button", { name: "More information" }));
+  expect(await screen.findByText("Manage your sessions")).toBeVisible();
+});
+
+it("keeps a destructive card warning visible", () => {
+  render(
+    <SectionCard title="Delete" description="Cannot be undone" danger>
+      <button>Delete</button>
+    </SectionCard>,
+  );
+  expect(screen.getByText("Cannot be undone")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "More information" })).toBeNull();
+});

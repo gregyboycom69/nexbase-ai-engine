@@ -1,0 +1,453 @@
+"""The agent-template reader - what it accepts, and what it refuses to guess.
+
+A template folder is read once per process and never validated again, so every
+refusal here is one somebody meets while the manifest is still in front of them
+rather than at publish, weeks later, in an organization that installed it.
+"""
+
+import re
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
+
+import pytest
+
+from app.core.config import settings
+from app.services import agent_templates
+
+pytestmark = pytest.mark.anyio
+
+
+def _write(root, industry: str, key: str, body: str) -> None:
+    folder = root / industry / key
+    folder.mkdir(parents=True)
+    (folder / agent_templates.MANIFEST).write_text(body, encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _uncached():
+    """The catalog is cached for the process; these tests move the root."""
+    agent_templates.catalog.cache_clear()
+    yield
+    agent_templates.catalog.cache_clear()
+
+
+class TestReadingTheCatalog:
+    def test_a_missing_directory_is_a_warning_rather_than_a_crash(self, tmp_path, monkeypatch):
+        """A deployment without the folder still starts; it just offers nothing."""
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path / "absent")
+
+        assert agent_templates.catalog() == ()
+
+    def test_loose_files_and_dot_folders_are_not_industries(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        (tmp_path / "README.md").write_text("not an industry", encoding="utf-8")
+        (tmp_path / "_wip").mkdir()
+        (tmp_path / "healthcare").mkdir()
+        (tmp_path / "healthcare" / ".draft").mkdir()
+        (tmp_path / "healthcare" / "notes.md").write_text("x", encoding="utf-8")
+        _write(
+            tmp_path, "healthcare", "desk", "---\nname: Desk\ndescription: d\n---\n\nYou answer.\n"
+        )
+
+        catalog = agent_templates.catalog()
+
+        assert [i.id for i in catalog] == ["healthcare"]
+        assert [t.key for t in catalog[0].templates] == ["healthcare/desk"]
+
+    def test_an_industry_whose_templates_all_fail_is_dropped(self, tmp_path, monkeypatch):
+        """An empty shelf is worse than no shelf - it looks like a bug in the UI."""
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(tmp_path, "broken", "no-body", "---\nname: X\ndescription: d\n---\n\n")
+
+        assert agent_templates.catalog() == ()
+
+    def test_one_bad_manifest_does_not_cost_its_neighbours(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(tmp_path, "healthcare", "bad", "---\nname: X\n---\n\nNo description.\n")
+        _write(
+            tmp_path, "healthcare", "good", "---\nname: Good\ndescription: d\n---\n\nYou answer.\n"
+        )
+
+        catalog = agent_templates.catalog()
+
+        assert [t.key for t in catalog[0].templates] == ["healthcare/good"]
+
+    def test_get_resolves_by_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(tmp_path, "legal", "intake", "---\nname: Intake\ndescription: d\n---\n\nYou take.\n")
+
+        assert agent_templates.get("legal/intake") is not None
+        assert agent_templates.get("legal/missing") is None
+
+
+class TestTheStarterTemplate:
+    def test_its_bindings_are_keyed_by_capability(self, tmp_path, monkeypatch):
+        """What the Toolbox recommends, and what a new agent starts with."""
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        folder, name = agent_templates.STARTER_TEMPLATE.split("/")
+        _write(
+            tmp_path,
+            folder,
+            name,
+            "---\nname: Starter\ndescription: d\ncapabilities:\n- clock\n"
+            "- id: sandbox\n  config:\n    include_execute: true\n---\n\nYou work.\n",
+        )
+
+        # An organization that can run a container workspace gets the binding as
+        # written; one that cannot falls back - see `TestForThisDeployment`.
+        assert agent_templates.starter_capabilities(container_workspace=True) == {
+            "clock": {"id": "clock"},
+            "sandbox": {"id": "sandbox", "config": {"include_execute": True}},
+        }
+
+    def test_an_image_without_it_recommends_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+
+        assert agent_templates.starter_capabilities(container_workspace=True) == {}
+
+    def test_the_shipped_starter_binds_only_registered_capabilities(self):
+        """A typo in the manifest would recommend a switch the Toolbox never shows."""
+        from app.agents.capabilities import all_capabilities
+
+        registered = {definition.id for definition in all_capabilities()}
+        starter = agent_templates.starter_capabilities(container_workspace=True)
+
+        assert starter
+        assert set(starter) <= registered
+
+    def test_a_new_agent_starts_with_drafts(self):
+        assert "drafts" in agent_templates.starter_capabilities()
+
+    def test_every_shipped_template_offers_drafts_beside_ask_user(self):
+        bound = {
+            template.key: {binding["id"] for binding in template.capabilities}
+            for industry in agent_templates.catalog()
+            for template in industry.templates
+        }
+
+        assert bound
+        assert [
+            key for key, ids in bound.items() if "ask_user" in ids and "drafts" not in ids
+        ] == []
+
+    @pytest.mark.anyio
+    async def test_the_capability_catalog_carries_the_starters_binding(self):
+        """Marked Recommended in the Toolbox, config and all, and nothing else is."""
+        from app.api.routes.v1.agents import list_capability_catalog
+
+        sandboxes = MagicMock(can_provide=AsyncMock(return_value=True))
+        catalog = await list_capability_catalog(MagicMock(organization_id=uuid4()), sandboxes)
+        starter = agent_templates.starter_capabilities(container_workspace=True)
+        by_id = {entry.id: entry for entry in catalog.items}
+
+        sandbox = by_id["sandbox"].recommended
+        assert sandbox is not None
+        assert sandbox.config == starter["sandbox"].get("config", {})
+        assert by_id["guardrails"].recommended is None
+        assert {i for i, e in by_id.items() if e.recommended} == set(starter) & set(by_id)
+
+    @pytest.mark.anyio
+    async def test_an_organization_without_a_sandbox_is_recommended_the_files_only_one(self):
+        """So a new agent made with the defaults publishes there; delegation keeps the
+        workspace it shares, since the workspace is still bound."""
+        from app.api.routes.v1.agents import list_capability_catalog
+
+        org = uuid4()
+        sandboxes = MagicMock(can_provide=AsyncMock(return_value=False))
+        catalog = await list_capability_catalog(MagicMock(organization_id=org), sandboxes)
+        by_id = {entry.id: entry for entry in catalog.items}
+
+        sandboxes.can_provide.assert_awaited_once_with(org)
+        workspace = by_id["sandbox"].recommended
+        assert workspace is not None and workspace.config.get("backend") == "state"
+        assert "include_execute" not in workspace.config
+
+
+class TestForThisDeployment:
+    """What a template cannot know - this deployment's browser and sandbox."""
+
+    BINDINGS = (
+        {"id": "browser_use", "config": {"max_steps": 20}},
+        {"id": "sandbox", "config": {"backend": "service", "include_execute": True}},
+        {"id": "clock"},
+    )
+
+    def test_its_own_browser_and_sandbox_are_used_where_it_runs_them(self, monkeypatch):
+        monkeypatch.setattr(settings, "BROWSER_SIGN_IN_CDP_URL", "http://browser:9222")
+
+        assert agent_templates.for_this_deployment(self.BINDINGS, container_workspace=True) == [
+            {"id": "browser_use", "config": {"max_steps": 20, "cdp_url": "http://browser:9222"}},
+            {"id": "sandbox", "config": {"backend": "service", "include_execute": True}},
+            {"id": "clock"},
+        ]
+
+    def test_without_them_the_browser_is_left_out_and_the_workspace_keeps_files(self, monkeypatch):
+        """Either would refuse at publish, and the starter is every new agent's default."""
+        monkeypatch.setattr(settings, "BROWSER_SIGN_IN_CDP_URL", "")
+
+        assert agent_templates.for_this_deployment(self.BINDINGS, container_workspace=False) == [
+            {"id": "sandbox", "config": {"backend": "state"}},
+            {"id": "clock"},
+        ]
+
+    def test_a_browser_the_template_names_is_kept(self, monkeypatch):
+        monkeypatch.setattr(settings, "BROWSER_SIGN_IN_CDP_URL", "")
+        named = ({"id": "browser_use", "config": {"cdp_url": "http://other:9222"}},)
+
+        assert agent_templates.for_this_deployment(named, container_workspace=True) == list(named)
+
+
+class TestWhatAManifestMayCarry:
+    def test_the_folder_name_is_the_fallback_name(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(tmp_path, "legal", "intake", "---\ndescription: d\n---\n\nYou take.\n")
+
+        assert agent_templates.catalog()[0].templates[0].name == "intake"
+
+    def test_a_binding_is_an_id_or_a_mapping_carrying_one(self, tmp_path, monkeypatch):
+        """`- clock` is the readable form and `- {id: knowledge, config: ...}` the full one."""
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(
+            tmp_path,
+            "legal",
+            "intake",
+            "---\nname: I\ndescription: d\ncapabilities:\n  - clock\n"
+            "  - {id: knowledge, config: {default_top_k: 3}}\n"
+            "skills:\n  - legal/matter-intake\nmcp:\n  - notion\nattach:\n  - collection\n"
+            "budget_usd: 25\n---\n\nYou take.\n",
+        )
+
+        template = agent_templates.catalog()[0].templates[0]
+
+        assert template.capabilities == (
+            {"id": "clock"},
+            {"id": "knowledge", "config": {"default_top_k": 3}},
+        )
+        assert template.skills == ("legal/matter-intake",)
+        assert template.mcp == ("notion",)
+        assert template.attach == ("collection",)
+        assert template.budget_usd == 25.0
+
+    def test_a_budget_that_is_not_a_number_is_dropped_rather_than_guessed(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(
+            tmp_path, "legal", "i", "---\nname: I\ndescription: d\nbudget_usd: soon\n---\n\nYou.\n"
+        )
+
+        assert agent_templates.catalog()[0].templates[0].budget_usd is None
+
+    @pytest.mark.parametrize(
+        "frontmatter",
+        [
+            "name: X\ndescription: d\ncapabilities: clock",
+            "name: X\ndescription: d\ncapabilities:\n  - [nope]",
+            "name: X\ndescription: d\nskills: healthcare/one",
+        ],
+        ids=["capabilities-not-a-list", "binding-without-an-id", "skills-not-a-list"],
+    )
+    def test_a_manifest_shaped_wrongly_is_skipped(self, tmp_path, monkeypatch, frontmatter):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(tmp_path, "legal", "i", f"---\n{frontmatter}\n---\n\nYou answer.\n")
+
+        assert agent_templates.catalog() == ()
+
+
+class TestMcpBindings:
+    """A template may bind a server nobody has to authorise - the platform's own."""
+
+    def test_bindings_are_carried_as_the_spec_takes_them(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(
+            tmp_path,
+            "general",
+            "architect",
+            "---\nname: A\ndescription: d\nmcp_servers:\n- account: platform\n---\n\nYou help.\n",
+        )
+
+        [template] = agent_templates.catalog()[0].templates
+
+        assert template.mcp_servers == ({"account": "platform"},)
+
+    def test_a_binding_list_of_names_is_a_manifest_to_fix(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(
+            tmp_path,
+            "general",
+            "architect",
+            "---\nname: A\ndescription: d\nmcp_servers:\n- platform\n---\n\nYou help.\n",
+        )
+
+        assert agent_templates.catalog() == ()
+
+
+class TestStartersAndAvatars:
+    def test_starters_and_an_avatar_beside_the_manifest_are_carried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(
+            tmp_path,
+            "general",
+            "helper",
+            "---\nname: H\ndescription: d\nstarters:\n- What can you do?\n---\n\nYou help.\n",
+        )
+        (tmp_path / "general" / "helper" / agent_templates.AVATAR).write_bytes(b"\x89PNG")
+
+        [template] = agent_templates.catalog()[0].templates
+
+        assert template.starters == ("What can you do?",)
+        assert template.avatar == tmp_path / "general" / "helper" / "avatar.png"
+
+    def test_a_template_with_neither_has_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(agent_templates, "TEMPLATES_ROOT", tmp_path)
+        _write(tmp_path, "general", "helper", "---\nname: H\ndescription: d\n---\n\nYou help.\n")
+
+        [template] = agent_templates.catalog()[0].templates
+
+        assert template.starters == ()
+        assert template.avatar is None
+
+
+class TestTheShippedAgenticOSAgent:
+    @pytest.mark.security
+    def test_it_reaches_the_platform_with_writes_held_for_approval(self):
+        """A fresh agent from it answers questions about the platform out of the
+        box, and asks before changing anything there (#2190)."""
+        template = agent_templates.get("general/agenticos")
+
+        assert template is not None
+        assert {"account": "platform", "approval": "writes"} in template.mcp_servers
+
+    def test_it_is_called_after_the_product_and_wears_its_mark(self):
+        """The agent most people talk to first is the product's own (#2301)."""
+        template = agent_templates.get(agent_templates.STARTER_TEMPLATE)
+
+        assert template is not None
+        assert template.name == "AgenticOS"
+        assert template.avatar is not None
+        assert template.avatar.read_bytes().startswith(b"\x89PNG")
+
+    def test_its_instructions_name_whichever_agent_they_are_copied_into(self):
+        """A new agent starts from these instructions, so they say its own name."""
+        template = agent_templates.get(agent_templates.STARTER_TEMPLATE)
+
+        assert template is not None
+        assert template.instructions.startswith("You are {{agent_name}}")
+
+
+def _instruction_texts(value: object) -> list[str]:
+    """Every `instructions` string under a template's bindings, at any depth."""
+    if isinstance(value, dict):
+        found = [v for k, v in value.items() if k == "instructions" and isinstance(v, str)]
+        return found + [t for v in value.values() for t in _instruction_texts(v)]
+    if isinstance(value, list | tuple):
+        return [t for v in value for t in _instruction_texts(v)]
+    return []
+
+
+def _wrapped_lines(text: str) -> list[str]:
+    """Lines that continue the sentence above them - a hard wrap, not a new block."""
+    starts_block = ("- ", "* ", "+ ", "#", ">", "|", "```", "~~~")
+    wrapped, fenced, previous = [], False, ""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+        elif (
+            not fenced
+            and stripped
+            and previous
+            and not previous.startswith(("|", "#"))
+            and not stripped.startswith(starts_block)
+            and not re.match(r"\d+[.)] ", stripped)
+        ):
+            wrapped.append(stripped)
+        previous = "" if fenced else stripped
+    return wrapped
+
+
+class TestShippedInstructions:
+    """The catalog the product ships, read as an installed agent reads it."""
+
+    def test_instructions_are_whole_paragraphs_not_80_column_lines(self):
+        """The Builder's editor and the spec export show the text as written, so a
+        template hard-wrapped for the repository arrived as a column of short
+        lines in every agent installed from it."""
+        offenders = {
+            template.key: lines
+            for industry in agent_templates.catalog()
+            for template in industry.templates
+            for text in [template.instructions, *_instruction_texts(template.capabilities)]
+            if (lines := _wrapped_lines(text))
+        }
+
+        assert offenders == {}
+
+    def test_every_control_an_agent_points_at_is_one_the_console_has(self):
+        """A `?highlight=` naming an anchor nobody renders opens the page and points
+        at nothing, so an agent saying "here" shows the person the whole screen
+        (#2301)."""
+        console = Path(__file__).resolve().parents[2] / "frontend" / "src"
+        anchors = {
+            match
+            for source in console.rglob("*.tsx")
+            for match in re.findall(r'data-tour="([a-z-]+)"', source.read_text(encoding="utf-8"))
+        }
+        pointed_at = {
+            template.key: missing
+            for industry in agent_templates.catalog()
+            for template in industry.templates
+            if (missing := set(re.findall(r"highlight=([a-z-]+)", template.instructions)) - anchors)
+        }
+
+        assert anchors
+        assert pointed_at == {}
+
+
+def test_shipped_agents_have_async_work_and_bounded_search_defaults() -> None:
+    from app.services import agent_templates
+
+    for key in ["general/agenticos", "general/platform-assistant"]:
+        template = agent_templates.get(key)
+        assert template is not None
+        bindings = {binding["id"]: binding for binding in template.capabilities}
+        assert {
+            "monitor",
+            "background_tasks",
+            "background_tools",
+            "tool_search",
+            "conversation_search",
+            "subagents",
+        } <= bindings.keys()
+        assert bindings["tool_search"]["config"] == {
+            "strategy": "local_bm25",
+            "max_results": 5,
+            "defer_capabilities": True,
+            "exclude_capabilities": ["ask_user", "sandbox"],
+        }
+        assert bindings["conversation_search"]["config"]["max_results"] == 5
+        config = bindings["subagents"]["config"]
+        assert config["allow_dynamic"] and config["mode"] == "auto"
+        assert {entry["name"] for entry in config["inline"]} == {"research", "explore", "review"}
+        if key == "general/agenticos":
+            assert {"computer_use", "coding_agent", "browser_use"} <= bindings.keys()
+        else:
+            assert not (bindings.keys() & agent_templates.AGENTICOS_ONLY)
+    assert not (agent_templates.starter_capabilities().keys() & agent_templates.AGENTICOS_ONLY)
+
+
+def test_explicit_desktop_browser_survives_without_a_deployment_cdp_endpoint(monkeypatch):
+    monkeypatch.setattr(settings, "BROWSER_SIGN_IN_CDP_URL", "")
+    binding = {"id": "browser_use", "config": {"connection": "local"}}
+    assert agent_templates.for_this_deployment((binding,)) == [binding]
+
+
+def test_shipped_agents_and_new_agent_defaults_do_not_offer_planning_tools() -> None:
+    for key in ("general/agenticos", "general/platform-assistant"):
+        template = agent_templates.get(key)
+        assert template is not None
+        assert "planning" not in {binding["id"] for binding in template.capabilities}
+        assert "write_plan" not in template.instructions
+        assert "planning tool" not in template.instructions
+    assert "planning" not in agent_templates.starter_capabilities()

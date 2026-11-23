@@ -1,0 +1,350 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useTranslations } from "next-intl";
+import { describe, expect, it, vi } from "vitest";
+
+import { AgentCard, accessSummary, type AgentCardActions } from "./agent-card";
+import type { Agent } from "@/types/agents";
+
+/**
+ * `accessSummary` answers with words, so it takes the translator the component holds.
+ * The suite's `next-intl` stands on the real catalog, which is what makes asserting
+ * on words here the same thing as asserting on what a reader sees.
+ */
+function useWords(subject: Agent): string {
+  return accessSummary(subject, useTranslations("agents"), useTranslations("audience")).label;
+}
+
+function agent(overrides: Partial<Agent>): Agent {
+  return {
+    id: "a1",
+    slug: "support",
+    name: "Support",
+    description: null,
+    status: "published",
+    visibility: "private",
+    owner_user_id: null,
+    current_version_id: null,
+    can_run: false,
+    ...overrides,
+  };
+}
+
+describe("accessSummary", () => {
+  it("an org-visible agent reads as the organization's, whatever the grant count", () => {
+    expect(useWords(agent({ visibility: "org", shared_user_count: 5 }))).toBe("Organization");
+  });
+
+  it("a team-visible agent reads as the team's", () => {
+    expect(useWords(agent({ visibility: "team" }))).toBe("Team");
+  });
+
+  it("a private agent with grants says how many people were handed it", () => {
+    expect(useWords(agent({ visibility: "private", shared_user_count: 3 }))).toBe("Shared with 3");
+  });
+
+  it("an agent shared with departments is named by them (#2072)", () => {
+    expect(useWords(agent({ shared_groups: ["Finance"], shared_user_count: 2 }))).toBe("Finance");
+    expect(useWords(agent({ shared_groups: ["Finance", "HR", "Sales", "Legal"] }))).toBe(
+      "Finance, HR +2",
+    );
+  });
+
+  it("a private agent nobody was handed reads as private, including when the listing omits the count", () => {
+    expect(useWords(agent({ visibility: "private", shared_user_count: 0 }))).toBe("Private");
+    expect(useWords(agent({ visibility: "private" }))).toBe("Private");
+  });
+});
+
+function mount(overrides: Partial<Agent> = {}, { canEdit = true, busy = false } = {}) {
+  const actions: AgentCardActions = {
+    onDuplicate: vi.fn(),
+    onArchive: vi.fn(),
+    onRestore: vi.fn(),
+    onDelete: vi.fn(),
+  };
+  render(<AgentCard agent={agent(overrides)} canEdit={canEdit} actions={actions} busy={busy} />);
+  return actions;
+}
+
+/**
+ * One agent in the gallery.
+ *
+ * The whole card is the link to the builder and the menu sits outside it: a
+ * button nested inside an anchor navigates when somebody meant to open a menu,
+ * and it is invalid to a screen reader besides. Everything below asserts through
+ * the accessible names, which is the only way that stays true.
+ */
+describe("AgentCard", () => {
+  it("flags an agent that needs attention, saying why on hover", () => {
+    render(
+      <AgentCard
+        agent={agent({ name: "Refund desk" })}
+        canEdit={false}
+        attention={{
+          agent_id: "a1",
+          name: "Refund desk",
+          rated_down: 5,
+          failed_runs: 0,
+          failing_suites: 1,
+          can_edit: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Needs attention")).toHaveAttribute(
+      "title",
+      "5 answers rated down · 1 failing suite",
+    );
+  });
+
+  it("keeps an agent with attention on the normal builder route", () => {
+    render(
+      <AgentCard
+        agent={agent({ id: "a9", name: "Refund desk" })}
+        canEdit
+        attention={{
+          agent_id: "a9",
+          name: "Refund desk",
+          rated_down: 5,
+          failed_runs: 0,
+          failing_suites: 0,
+          can_edit: true,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Needs attention").closest("a")).toBeNull();
+    expect(screen.getByRole("link", { name: "Open Refund desk" })).toHaveAttribute(
+      "href",
+      "/agents/a9",
+    );
+    expect(screen.queryByRole("link", { name: /Improve/ })).toBeNull();
+  });
+
+  it("only describes the attention to a reader who may not improve the agent", () => {
+    render(
+      <AgentCard
+        agent={agent({ name: "Refund desk" })}
+        canEdit={false}
+        attention={{
+          agent_id: "a1",
+          name: "Refund desk",
+          rated_down: 5,
+          failed_runs: 0,
+          failing_suites: 0,
+          can_edit: false,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Needs attention").closest("a")).toBeNull();
+  });
+
+  it("flags nothing without a reason to", () => {
+    mount({ name: "Refund desk" });
+
+    expect(screen.queryByText("Needs attention")).toBeNull();
+  });
+
+  it("marks the judge the platform seeded as the default one", () => {
+    mount({ system_key: "eval_judge", name: "Eval judge", kind: "judge" });
+
+    expect(screen.getByText("Default judge")).toBeInTheDocument();
+  });
+
+  it("names the kind a seeded agent is the default of", () => {
+    mount({ system_key: "case_generator", name: "Case generator", kind: "generator" });
+
+    expect(screen.getByText("Default case generator")).toBeInTheDocument();
+    expect(screen.queryByText("Default judge")).toBeNull();
+  });
+
+  it("names the kind of an organization's own system agent, which is nobody's default", () => {
+    mount({ system_key: null, name: "Refunds judge", kind: "judge" });
+
+    expect(screen.getByText("System agent · Judge")).toHaveAttribute(
+      "title",
+      "The platform runs it for the whole organization; nobody chats with it.",
+    );
+    expect(screen.queryByText("Default judge")).toBeNull();
+  });
+
+  it("lets an editor open a card with no menu, as a judge's has none", () => {
+    render(
+      <AgentCard
+        agent={agent({ name: "Refunds judge", kind: "judge" })}
+        canEdit
+        footer={<p>Used by Refunds</p>}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "Edit Refunds judge" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /more actions/i })).toBeNull();
+    expect(screen.getByText("Used by Refunds")).toBeInTheDocument();
+  });
+
+  it("marks nothing on an agent a person made", () => {
+    mount();
+
+    expect(screen.queryByText("Default judge")).toBeNull();
+    expect(screen.queryByText(/System agent/)).toBeNull();
+  });
+
+  it("opens the builder from anywhere on the card", () => {
+    mount();
+
+    expect(screen.getByRole("link", { name: "Open Support" })).toHaveAttribute(
+      "href",
+      "/agents/a1",
+    );
+  });
+
+  it("says an agent has no description rather than leaving the line blank", () => {
+    mount({ description: null });
+
+    expect(screen.getByText("No description.")).toBeInTheDocument();
+  });
+
+  it("says when an agent was last edited, and says so when it never was", () => {
+    mount({ updated_at: null });
+
+    expect(screen.getByText("never edited")).toBeInTheDocument();
+  });
+
+  it("dates the last edit when there is one", () => {
+    mount({ updated_at: "2026-07-01T10:00:00Z" });
+
+    expect(screen.getByText(/^edited /)).toBeInTheDocument();
+  });
+
+  it("offers a reader the card and nothing to act on", () => {
+    // Duplicating, archiving and deleting are all `agents:edit` on the server.
+    mount({}, { canEdit: false });
+
+    expect(screen.getByRole("link", { name: "Open Support" })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "Edit Support" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /More actions/ })).toBeNull();
+  });
+
+  it("duplicates from the menu", async () => {
+    const actions = mount();
+
+    await userEvent.click(screen.getByRole("button", { name: "More actions for Support" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /^Duplicate/ }));
+
+    expect(actions.onDuplicate).toHaveBeenCalled();
+  });
+
+  it("offers archive for a live agent and restore for an archived one", async () => {
+    const actions = mount({ status: "archived" });
+
+    await userEvent.click(screen.getByRole("button", { name: "More actions for Support" }));
+    expect(screen.queryByRole("menuitem", { name: /^Archive/ })).toBeNull();
+    await userEvent.click(screen.getByRole("menuitem", { name: /^Restore/ }));
+
+    expect(actions.onRestore).toHaveBeenCalled();
+  });
+
+  it("archives a live agent", async () => {
+    const actions = mount();
+
+    await userEvent.click(screen.getByRole("button", { name: "More actions for Support" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /^Archive/ }));
+
+    expect(actions.onArchive).toHaveBeenCalled();
+  });
+
+  it("deletes permanently, and says that is what it is", async () => {
+    const actions = mount();
+
+    await userEvent.click(screen.getByRole("button", { name: "More actions for Support" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /^Delete permanently/ }));
+
+    expect(actions.onDelete).toHaveBeenCalled();
+  });
+
+  it("says under each action what it does", async () => {
+    mount();
+    await userEvent.click(screen.getByRole("button", { name: "More actions for Support" }));
+
+    expect(screen.getByRole("menuitem", { name: /^Archive/ })).toHaveTextContent(
+      "Out of the pickers; its history stays",
+    );
+  });
+
+  it("draws no metadata chips when a listing carries none", () => {
+    // The fields are optional in the type; the card reads them as `?? []`.
+    mount({});
+
+    expect(screen.queryByText("sales")).toBeNull();
+  });
+
+  it("shows who the agent is reachable by, as one chip", () => {
+    mount({ visibility: "org" });
+
+    expect(screen.getByText("Organization")).toBeInTheDocument();
+  });
+
+  it("stops a second action while one is in flight", () => {
+    // The card keeps its controls but nothing reaches them, so a double archive
+    // cannot be sent while the first is still open.
+    const { container } = render(
+      <AgentCard
+        agent={agent({})}
+        canEdit
+        busy
+        actions={{
+          onDuplicate: vi.fn(),
+          onArchive: vi.fn(),
+          onRestore: vi.fn(),
+          onDelete: vi.fn(),
+        }}
+      />,
+    );
+
+    // The card itself, not the beam wrapped around it.
+    expect(container.querySelector(".bg-card")).toHaveClass("pointer-events-none");
+  });
+
+  it("does not rebuild the card when the beam lights", () => {
+    // The beam is mounted for every card and only runs on the hovered one. If
+    // it mounted on hover instead, the card the mouse had just arrived on would
+    // be torn down and rebuilt under it.
+    const { container } = render(
+      <AgentCard
+        agent={agent({})}
+        canEdit
+        actions={{
+          onDuplicate: vi.fn(),
+          onArchive: vi.fn(),
+          onRestore: vi.fn(),
+          onDelete: vi.fn(),
+        }}
+      />,
+    );
+    const card = container.querySelector(".bg-card")!;
+
+    fireEvent.mouseEnter(card);
+    expect(container.querySelector(".bg-card")).toBe(card);
+
+    fireEvent.mouseLeave(card);
+    expect(container.querySelector(".bg-card")).toBe(card);
+  });
+});
+
+it("shows the edit date directly while keeping access and actions available", () => {
+  mount({ channels: ["slack"], categories: ["Sales"] });
+  expect(screen.queryByText("Details")).toBeNull();
+  expect(screen.getByText("never edited")).toBeVisible();
+  expect(screen.getByText("Private")).toBeVisible();
+  expect(screen.getByRole("button", { name: "More actions for Support" })).toBeVisible();
+});
+
+it("marks archived agents without washing out their portrait", () => {
+  mount({ status: "archived" });
+  expect(screen.getByRole("link", { name: "Open Support" }).parentElement).not.toHaveClass(
+    "opacity-70",
+  );
+  expect(screen.getByText("archived")).toBeVisible();
+});

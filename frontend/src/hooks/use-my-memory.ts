@@ -1,0 +1,117 @@
+"use client";
+
+import { useCallback, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { useTranslations } from "next-intl";
+
+import { getErrorMessage } from "@/lib/api-error";
+import {
+  deleteNote,
+  getMyMemory,
+  setNoteActive,
+  editNoteContent,
+  type MemoryNote,
+  type MemoryPage,
+} from "@/lib/memory-api";
+import { useChanged } from "./use-changed";
+import { qk } from "@/lib/query-keys";
+import { useOrgStore } from "@/stores";
+
+/** Notes per page. Enough that most people never see a second one. */
+export const PAGE_SIZE = 50;
+
+interface UseMyMemoryResult {
+  page: MemoryPage | undefined;
+  isLoading: boolean;
+  /** The read failed after its retries. Distinct from `isLoading`, and from an empty store. */
+  error: unknown;
+  skip: number;
+  showPage: (skip: number) => void;
+  setActive: (id: string, active: boolean) => Promise<boolean>;
+  remove: (id: string) => Promise<boolean>;
+  update: (note: MemoryNote, content: string) => Promise<boolean>;
+}
+
+/**
+ * What the agents in the active organization have written down about the caller.
+ *
+ * Keyed on the active organization because memory is per tenant: the same person
+ * has a different store in each, and one cache entry for both would show Acme's
+ * notes after switching to Globex. The page is part of the key too, so moving
+ * between pages does not read one page's rows out of another's cache entry.
+ *
+ * Every mutation reports its own failure. A privacy action that fails silently
+ * leaves somebody believing a note has stopped reaching the model when it has
+ * not, which is the worst outcome this screen can produce (#1594 review).
+ */
+export function useMyMemory(q = ""): UseMyMemoryResult {
+  const queryClient = useQueryClient();
+  const t = useTranslations("errors");
+  const activeOrgId = useOrgStore((state) => state.activeOrgId);
+  const [skip, setSkip] = useState(0);
+  if (useChanged(`${activeOrgId}:${q}`)) setSkip(0);
+  const queryKey = qk.memory.mine(activeOrgId ?? "current", skip, q);
+
+  const { data, isLoading, error } = useQuery({
+    queryKey,
+    queryFn: () => getMyMemory(skip, PAGE_SIZE, q),
+  });
+
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: qk.memory.all(activeOrgId ?? "current") });
+
+  const toggle = useMutation({
+    mutationFn: ({ id, active }: { id: string; active: boolean }) => setNoteActive(id, active),
+    onSuccess: invalidate,
+    onError: (cause) => toast.error(getErrorMessage(cause, t)),
+  });
+
+  const removal = useMutation({
+    mutationFn: (id: string) => deleteNote(id),
+    onSuccess: invalidate,
+    onError: (cause) => toast.error(getErrorMessage(cause, t)),
+  });
+
+  const correction = useMutation({
+    mutationFn: ({ note, content }: { note: MemoryNote; content: string }) =>
+      editNoteContent(note, content),
+    onSuccess: invalidate,
+    onError: (cause) => toast.error(getErrorMessage(cause, t)),
+  });
+  const update = async (note: MemoryNote, content: string): Promise<boolean> => {
+    try {
+      await correction.mutateAsync({ note, content });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // A refused privacy action stays open; onError reports why it failed.
+  const setActive = useCallback(
+    async (id: string, active: boolean) => {
+      try {
+        await toggle.mutateAsync({ id, active });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [toggle],
+  );
+
+  const remove = useCallback(
+    async (id: string) => {
+      try {
+        await removal.mutateAsync(id);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [removal],
+  );
+
+  return { page: data, isLoading, error, skip, showPage: setSkip, setActive, remove, update };
+}

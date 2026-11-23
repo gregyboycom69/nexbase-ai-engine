@@ -1,0 +1,219 @@
+# coding_agent
+
+Claude Code or Codex, doing software work in the agent's own sandbox (#2092).
+
+## What it is
+
+One tool, `run_coding_agent`. The agent hands Claude Code or Codex a whole task;
+the harness works on it in the sandbox until it is done, and the chat shows it
+working. What the harness may do is the binding's `access`, not the model's
+choice: `edit` changes files and runs commands, `read_only` reads and answers
+(Claude Code in a container - Codex's read-only mode is its own sandbox, which cannot start
+inside the container, and then even `cat` fails). Whether a person approves each
+task first is the capability's approval, set to **Always ask**; the capability
+declares `tool_settings=False`, so the Builder shows no per-tool tab for a tool
+that *is* the capability.
+
+The tasks of one conversation continue one harness session. The session id is
+kept in the sandbox at `.agenticos/coding-agent/<harness>.session`, the second task
+resumes it, `fresh_session` starts over, and a session the sandbox lost (a fresh
+container) starts over by itself, once.
+
+An agent with this capability is a *coding agent*. Another agent hands it work
+through ordinary delegation, the same way it reaches any specialist.
+
+## Detached, and watched
+
+The harness is started in a session of its own (`setsid nohup`) with its events
+written to a file, and the platform polls that file - one command per poll that
+answers with the new bytes, base64, and the exit code once there is one
+(`_task.py`). Two reasons. A coding task outlives the sandbox service's ceiling
+for one command. And a person should see Claude Code read, edit and run tests as
+it does them: each event becomes the delegation frames the chat already draws
+(`_narration.py`, `app.agents.subagent_events`), so the harness gets a panel of
+its own under its own mark, nested under a delegate that handed the task on. A
+timed-out task, and a run that is cancelled, has its process group stopped.
+
+## Why headless through the sandbox's shell, not ACP
+
+The Agent Client Protocol drives a harness over a long-lived stdio session. The
+sandbox runs commands and returns their output; it holds no interactive session
+to keep one open in. Both harnesses also run headless with a machine-readable
+event stream - `claude -p --output-format stream-json`, `codex exec --json` -
+which is what OpenClaw's CLI backends use, and that is what this does.
+
+## Why one approval per task
+
+A harness asks permission per file and per command when a person sits at its
+terminal. Nobody does here, and forwarding each of those prompts through the
+platform would make a person approve forty edits to accept one change. So the
+platform asks once, before the task, when the approval is set, and the harness
+runs with its own prompts off at `edit`: Claude Code with
+`--dangerously-skip-permissions` (and `IS_SANDBOX=1`, which it asks for when run
+as root), Codex with `--dangerously-bypass-approvals-and-sandbox`. The container
+is the boundary, which is what both flags are documented for. At `read_only`
+Claude Code runs in its default permission mode without its editing tools and
+with only reading commands allowed, and is told nobody can approve anything else
+(it otherwise tells the person to "approve the deletion").
+
+## What it costs
+
+Each harness reports its tokens per model, and they are booked to the run's
+ledger like any model call, so budgets apply and the run's cost includes them.
+The budget is checked before each task. Codex does not name its model in its
+events, so a binding with no `model` books Codex's usage unpriced and the run's
+cost says it is partial.
+
+## What it needs
+
+- The `sandbox` capability on the `service` backend with the shell on, which
+  publish checks.
+- A runtime with the harness installed. `workbench` pins Claude Code and Codex.
+- A credential in the vault. Claude Code: an Anthropic API key, or the token
+  `claude setup-token` prints for a Claude subscription (told apart by its
+  `sk-ant-oat` prefix, and sent as `CLAUDE_CODE_OAUTH_TOKEN`); behind a gateway
+  such as OpenRouter, `base_url` names it and the key is the gateway's. Codex: an
+  OpenAI API key, or a ChatGPT sign-in, which is written to `~/.codex/auth.json`
+  outside the workspace for the task and read back afterwards, so a pair Codex
+  refreshed is sealed over the same secret - its refresh token is single-use.
+  Codex's `auth.json` also wants an `id_token`, which the sign-in does not keep;
+  the CLI reads only its claims, so one is made of the access token's.
+  The requirement's `purposes_by` maps each harness to the purposes its key may
+  have - `anthropic` for Claude Code, `openai` or `openai_codex` for Codex,
+  `custom` for either - and both the Builder's picker and publish read it, so an
+  OpenAI key bound to Claude Code is refused before it can run (#2485). Its
+  `open_when_set` lifts that for Claude Code once `base_url` is set: the key is
+  then the gateway's, whichever gateway it is.
+  A credential reaches the command through its environment, never on its
+  command line.
+
+## What a task changed (#2480)
+
+At `edit`, in a conversation, the workspace is snapshotted before the task and
+again after it (`_changes.py`), and the difference is kept in
+`coding_task_changes` for the task's panel; the report carries only its id, since
+the report is what the model reads back on every later turn. The snapshot is a
+git tree in a store of the task's own under `/tmp`, made with its own index and
+`find` rather than `git add`: a person's clone is never touched, and a clone
+inside the workspace is diffed file by file instead of as one commit id. The
+platform's own files (`.agenticos/`, `skills/`, `tool_output/`) and toolchain
+folders are left out - a spill in a shared workspace is another person's tool
+result. A snapshot that cannot be taken - no `git`, a timeout - costs the diff,
+never the task.
+
+The panel and message footer use that stored file list, including changes made
+through the shell. Without a change set, a new report uses the harness's list,
+with paths relative to the workspace.
+
+## Reverting a task (#2743)
+
+New tasks also keep the bounded patch as lossless bytes (base64), each file's
+before/after Git blob and mode, and the original workspace reference. The
+temporary snapshot store still goes away. Older rows remain readable and cannot
+offer undo: their display patch alone cannot establish the complete file state.
+
+Undo is offered only for a conversation-scoped container whose capture was
+isolated from other platform writers. Conversation workspace admission refuses
+overlapping runs, and the recording wrapper keeps other tools outside the coding
+task's whole snapshot interval. Project-, agent-, channel- and user-scoped
+snapshots remain readable without undo: a diff can include another chat's work.
+
+Both snapshots must cover every regular file in their scope. An oversized file
+not already in the private index, an unreadable path or an unsupported file type
+makes undo unavailable, even when that path appears unchanged. The exclusion
+marker survives from the first snapshot to the second, so deleting or shrinking
+an excluded file cannot turn a partial capture into an undoable task. Failed
+traversal cannot supply a partial discovery list. The captured diff remains
+readable; platform and toolchain folders are deliberately outside this scope.
+
+The request requires current conversation edit access and queues its job and
+workspace reservation in one transaction. New runs and other reverts cannot
+enter the reserved workspace. The worker rechecks current membership and access,
+then releases its connection and row locks before the workspace command.
+It checks every affected regular file's complete content and mode,
+including absent rename destinations, before reversing the patch in a separate
+Git index. That index must exactly match the recorded before manifest; only then
+does `git apply --reverse --index` write the files. The user's repository, index
+and history are never used. A later edit anywhere in an affected file refuses
+the whole operation. Unrelated files stay as they are.
+
+Truncated or redacted patches, symlinks, hard-linked current files and files over
+2 MiB cannot be restored. The runtime needs Git and Python 3. The worker records
+the success marker and audit event together. If its response or final transaction
+is lost, the reservation survives: another attempt checks the full before/after
+states under a nonblocking workspace file lock. Already restored files are not
+reverted again. A mixed or unknown state stays reserved for reconciliation;
+the panel shows pending, failed or unknown outcomes. Repeating a completed
+revert returns its timestamp. This restores files, not conversation history or external
+effects such as commits, network requests or database writes.
+Manual queue retry is disabled: retrying from the conversation creates a new claim
+without resetting an old attempt's fence.
+A copied report without its original conversation file origin does not offer undo.
+
+The private snapshot and revert indexes disable checkout conversions from `.gitattributes`.
+Line endings, working-tree encodings and expanded identifiers are captured and restored
+as bytes, independently of the repository's Git settings.
+
+### Harness research behind the design
+
+- [OpenCode snapshots](https://opencode.ai/docs/snapshots) record before/after
+  steps in a separate object database and restore selected paths. Its documented
+  overwrite behavior is why this implementation additionally checks the entire
+  post-task file state.
+- [Gemini CLI checkpointing](https://geminicli.com/docs/cli/checkpointing/) uses a
+  shadow repository without changing the user's repository. Its whole-project
+  restoration is broader than this task-scoped undo.
+- [Aider's undo](https://github.com/Aider-AI/aider/blob/main/aider/commands.py#L560)
+  refuses later uncommitted changes to affected files. Here file fingerprints
+  provide that protection without requiring user-repository commits.
+- [Claude Code checkpointing](https://code.claude.com/docs/en/checkpointing)
+  follows editing tools, so shell-only changes can escape it. Keeping the
+  platform's workspace snapshots makes shell edits visible across harnesses.
+
+## What it does not do
+
+- Forward the harness's own permission prompts.
+- Run Codex read-only inside a container; local ACP tasks support its native read-only mode.
+- Run on the `state` workspace, which has no shell.
+- Keep a diff for a task on this computer, or one at `read_only`.
+
+## On the person's own computer (#2576)
+
+With **Where it runs: On this computer** the same tool starts the harness on the
+computer the person works from, in the folder they chose, instead of in the sandbox.
+The chat must be working on that computer (**Work on: This computer**); otherwise the
+tool says so rather than falling back to a sandbox.
+
+This path *is* ACP (`_acp.py`), unlike the sandbox one. The desktop app only starts
+the agent's adapter (`@agentclientprotocol/claude-agent-acp`, `codex-acp`, pinned to an
+exact version, through `npx`) and passes bytes both ways with the device operations
+`agent.open`, `agent.send`, `agent.poll` and `agent.close`; the server speaks the
+protocol, so an ACP change is a server change. A task initializes the adapter, creates or loads its conversation session, then sends `session/prompt`, with `session/update` becoming the same steps the
+chat already draws and a stop reason becoming the outcome.
+
+- **No key.** The agent signs in with its own command on that computer (Settings -> Desktop
+  app lists it and opens the sign-in in Terminal). The platform never reads or stores that
+  credential, so the secret is optional for this setting.
+- **Permissions.** Starting an agent needs the folder's *full access* grant - the adapter runs as
+  the person, which an OS sandbox would break - and native consent remembered for that agent, folder, adapter version and connection. Revoking the folder stops its running agents and removes its consent. Inside
+  a task the agent's `session/request_permission` is answered from the binding's `access`, not
+  put to a person one request at a time: a parked run could not keep the session alive, so the
+  approval is the capability's, once per task, as in the sandbox.
+- **Continuation.** The desktop stores up to 128 resume identifiers outside the repository,
+  scoped by connection, tenant, person, agent, conversation, canonical folder and access.
+  Each task starts a fresh process, then uses `session/load` to continue. `fresh_session`
+  explicitly starts over; a failed load never silently loses context. Unlinking clears identifiers.
+- **Steering.** A mid-task correction cancels the current ACP turn, waits for its result and
+  prompts the same session again. Guardrails screen corrections, the transcript acknowledges
+  their application and the report carries them back to the parent agent.
+- **Read-only.** Claude disables bypass permissions and restricts its tool inventory to reads.
+  Codex selects its native read-only mode before prompting. This also applies on session load.
+- **Usage.** A subscription session reports no tokens, so each task is booked as one unpriced
+  call and the run's cost says it is a floor.
+
+
+Personal cloud coding refuses collaborator-controlled source workspaces before
+loading the initiating person's credentials: projects, agent/channel scopes,
+group chats and conversations shared for editing. Copying files into a disposable
+private container isolates output writes; it does not make executable source
+trusted. Shared project work uses the organization-configured coding mode.

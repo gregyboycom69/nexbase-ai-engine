@@ -1,0 +1,136 @@
+/**
+ * Types for MCP servers, mirroring the backend.
+ *
+ * Two different things live here and the difference is the whole design:
+ *
+ * - The **catalog** (`GET /agents/mcp-catalog`) is the organization-level list
+ *   of servers the platform vouches for. It is curated and read-only - there is
+ *   no endpoint that adds to it, so nothing in the UI may pretend there is.
+ * - A **connection** (`/me/mcp-connections`) is a user's own credentialed link
+ *   to one of those servers. It is the only writable half, and the only half
+ *   that has an id.
+ *
+ * `McpConnectionRecord` deliberately is not redefined here - it already lives in
+ * `@/lib/mcp-connections-api` next to the calls that return it.
+ */
+
+/** How a catalog server authenticates. The only thing that really varies. */
+export type McpAuthKind = "none" | "token" | "oauth";
+
+/** One connectable server in the organization catalog. */
+export interface McpCatalogEntry {
+  key: string;
+  name: string;
+  description: string;
+  category: string;
+  auth: McpAuthKind;
+  /** Null when the organization self-hosts the server and supplies the URL. */
+  url: string | null;
+  docs_url: string | null;
+  /** What to tell the person pasting a credential. */
+  token_hint: string | null;
+  /**
+   * Whether somebody here checked this entry.
+   *
+   * True for the curated catalog: the auth flow works, the description is
+   * honest, the token hint says what kind of credential to paste. False for a
+   * server mirrored from the public registry, where the description is the
+   * publisher's and there is no hint because the registry has no such field.
+   *
+   * Optional so a response from before this field renders as reviewed rather
+   * than as suspect - the curated catalog is what those responses held.
+   */
+  reviewed?: boolean;
+  /** A saved server outside the curated catalog and mirrored registry. */
+  custom?: boolean;
+  /** Accessible accounts grouped by the listing API; null uses legacy matching. */
+  connection_ids?: string[] | null;
+  /** Brand mark to draw, by name. Null falls back to a monogram. */
+  icon: string | null;
+  /** The last catalog check found it answering as this entry says (#2103). */
+  verified?: boolean;
+  /** What that check found; absent or null when it was never checked. */
+  check?: McpCatalogCheck | null;
+}
+
+/** What `agenticos cmd mcp-catalog-check` found when it last called a server. */
+export interface McpCatalogCheck {
+  outcome:
+    | "open"
+    | "sign_in"
+    | "token"
+    | "unreachable"
+    | "broken"
+    | "refused"
+    | "duplicate"
+    | "self_hosted";
+  checked_at: string;
+  /** Tools it listed without a credential; null where it could not. */
+  tools: number | null;
+  read_only_tools: number | null;
+}
+
+export interface McpCatalog {
+  items: McpCatalogEntry[];
+  /** Matches across both sources, so a pager knows how many pages there are. */
+  total: number;
+  /**
+   * How many servers the mirrored public registry holds.
+   *
+   * What the list *reaches*, as distinct from what this page matched. Zero until
+   * `agenticos cmd mcp-registry-sync` has run, which is what a fresh install
+   * shows a curated-only list for.
+   */
+  registry_total?: number;
+}
+
+/**
+ * Where a catalog server stands for the current user.
+ *
+ * "connected" is the only state in which an agent can actually reach the
+ * server, so every other state is named after what is blocking it rather than
+ * collapsed into a single "not ready".
+ */
+export type McpConnectionState =
+  "not-connected" | "needs-authorization" | "disabled" | "error" | "connected";
+
+/** Whether any accessible account has been saved for a server. */
+export type McpServerStateFilter = "all" | "connected" | "not-connected";
+
+/** What a platform tool works on - `PlatformToolGroup` in `backend/app/schemas/agent.py`. */
+export type PlatformToolGroup =
+  | "tables"
+  | "tasks"
+  | "workflows"
+  | "agents"
+  | "knowledge"
+  | "skills"
+  | "projects"
+  | "automations"
+  | "apps"
+  | "runs"
+  | "connections"
+  | "account"
+  | "administration";
+
+/** One tool of this deployment's own MCP server, as a binding chooses from (#2190). */
+export interface PlatformMcpTool {
+  name: string;
+  /** The first line of what the model reads. */
+  description: string;
+  /** What it works on, which is how the Builder groups the tools. */
+  group: PlatformToolGroup;
+  /** Whether it changes something - held for approval under `approval: writes`. */
+  writes: boolean;
+  /** Runs without approval under every policy: it changes only the caller's own preference. */
+  ungated?: boolean;
+  /** Asks under every binding, its own `never` included: it widens who has authority. */
+  always_asks?: boolean;
+  /** A read held for approval all the same: it releases a whole past conversation. */
+  held?: boolean;
+}
+
+export interface PlatformMcpToolList {
+  items: PlatformMcpTool[];
+  total: number;
+}

@@ -1,0 +1,382 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+import { useSearchParams } from "next/navigation";
+import { useTranslations } from "next-intl";
+import { Bot, Check, ChevronDown, Star } from "lucide-react";
+import { WorkflowIcon as Workflow } from "@/components/icons/product-icons";
+
+import { Skeleton } from "@/components/ui/skeleton";
+import { AgentAvatar } from "@/components/agents/agent-avatar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui";
+import { useAgents, usePermissions, useWorkflows } from "@/hooks";
+import { useAgentSelectionStore, useConversationStore } from "@/stores";
+import { cn } from "@/lib/utils";
+import { CHAT_TRIGGER } from "@/lib/workflows/triggers";
+import type { WorkflowRead } from "@/lib/workflows/types";
+import type { Agent } from "@/types/agents";
+import { Perm } from "@/types/permissions";
+
+/**
+ * Whether an agent can be chatted with at all.
+ *
+ * Published agents can run. The trusted, never-published starter can instead
+ * explain model setup; selecting it never executes its draft.
+ */
+const isRunnable = (agent: Agent): boolean =>
+  agent.status === "published" || (agent.setup_required === true && agent.can_run === true);
+
+/**
+ * A workflow the chat can hand a message to: one whose live version starts from
+ * a chat message - the only trigger the chat's door runs.
+ */
+export const isChattable = (workflow: WorkflowRead): boolean =>
+  workflow.current_version_id !== null &&
+  workflow.status !== "archived" &&
+  (workflow.live_triggers?.length ? workflow.live_triggers : [workflow.live_trigger]).includes(
+    CHAT_TRIGGER,
+  );
+
+/**
+ * Who answers, as its own control beside the composer.
+ *
+ * It was a tab inside a settings popover, which put the most consequential
+ * choice in the conversation two clicks behind a slider. It is first-class
+ * here, showing the agent's face, because "which of these five agents am I
+ * talking to" is answered faster by a picture than by reading five names.
+ *
+ * An empty or stale selection resolves to the user's explicit default, then
+ * the shipped AgenticOS starter, then the first published agent. The starter
+ * remains selectable before publication so it can guide first-time setup.
+ *
+ * A member who may run workflows is offered the published ones as well: a
+ * message addressed to one starts a run of it, and its answer - a card with the
+ * run's status, then its words - comes back into the same thread.
+ *
+ * The choice applies from the next message, not retroactively - switching
+ * mid-conversation is a supported thing to do, and the transcript records the
+ * agent and version per turn, so a thread that changed hands says so rather
+ * than relabelling everything above it.
+ */
+export function AgentPicker() {
+  const t = useTranslations("chat.agentPicker");
+  // Archived agents included so a conversation that was had with one still
+  // resolves its name; `isRunnable` is what decides who can be picked.
+  const { agents, isLoading, isFetching } = useAgents({ includeArchived: true });
+  const selectedAgentId = useAgentSelectionStore((state) => state.selectedAgentId);
+  const selectAgent = useAgentSelectionStore((state) => state.select);
+  const defaultAgentId = useAgentSelectionStore((state) => state.defaultAgentId);
+  const setDefaultAgent = useAgentSelectionStore((state) => state.setDefault);
+  const currentConversationId = useConversationStore((state) => state.currentConversationId);
+  const selectedWorkflowId = useAgentSelectionStore((state) => state.selectedWorkflowId);
+  const selectWorkflow = useAgentSelectionStore((state) => state.selectWorkflow);
+  const { can } = usePermissions();
+  const { workflows } = useWorkflows({ enabled: can(Perm.workflowsRun) });
+
+  const options = useRef<HTMLDivElement>(null);
+  const runnable = agents.filter(isRunnable);
+  const selected =
+    agents.find((agent) => agent.id === selectedAgentId && isRunnable(agent)) ?? null;
+  const chattable = workflows.filter(isChattable);
+  const selectedWorkflow = chattable.find((workflow) => workflow.id === selectedWorkflowId) ?? null;
+  const answererName = selectedWorkflow?.name ?? selected?.name;
+
+  // No selection, or one pointing at an agent that has since been unpublished,
+  // resolves to the explicit default, starter, then a published agent. The store is
+  // read at send time, so this is also what keeps a frame from going out
+  // without an agent.
+  useEffect(() => {
+    if (isLoading || selected !== null) return;
+    // Not while the list is being refetched, and that is the whole of this
+    // guard. React Query serves the previous answer until the new one lands, so
+    // an agent published a second ago is missing from the list this render sees
+    // - and falling back then does not fill in an empty choice, it *replaces* a
+    // deliberate one. The Builder's "Open in chat" hands over an agent id and
+    // navigates; the picker would quietly hand the conversation to somebody
+    // else, having been told exactly who was wanted.
+    if (isFetching && selectedAgentId !== null) return;
+    const fallback =
+      runnable.find((agent) => agent.id === defaultAgentId) ??
+      runnable.find((agent) => agent.is_starter) ??
+      runnable[0];
+    if (fallback) selectAgent(fallback.id);
+  }, [isLoading, isFetching, selected, selectedAgentId, runnable, defaultAgentId, selectAgent]);
+
+  // `?agent=` - a handle or an id - is a link asking for one agent: a
+  // notification opening the starter agent's empty chat, where its suggestions
+  // wait (#2301). Once per link, and after the fallback above so it wins over it.
+  const wanted = useSearchParams().get("agent");
+  const handedOver = useRef<string | null>(null);
+  useEffect(() => {
+    if (!wanted || handedOver.current === wanted) return;
+    const named = runnable.find((agent) => agent.id === wanted || agent.slug === wanted);
+    if (!named) return;
+    handedOver.current = wanted;
+    selectAgent(named.id);
+  }, [wanted, runnable, selectAgent]);
+
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-tour="chat-agent-picker"
+          aria-label={
+            isLoading && !selected && !selectedWorkflow
+              ? t("loading")
+              : t("current", { name: answererName ?? t("noneSelected") })
+          }
+          aria-busy={isLoading && !selected && !selectedWorkflow}
+          disabled={isLoading && !selected && !selectedWorkflow}
+          // `min-w-0` so the name inside can actually give way: the trigger is
+          // in a row that runs out of room at 390px, and `max-w-[160px]` on the
+          // name is a cap rather than permission to shrink.
+          className="group/agent bg-foreground/[0.06] hover:bg-foreground/[0.1] data-[state=open]:bg-foreground/[0.12] text-foreground focus-visible:ring-ring touch:min-h-11 inline-flex min-w-0 touch-manipulation items-center gap-1.5 rounded-lg py-1 pr-2 pl-1 transition-colors outline-none focus-visible:ring-2"
+        >
+          {isLoading && !selected && !selectedWorkflow ? (
+            <Skeleton
+              data-testid="agent-picker-loading-icon"
+              className="size-6 shrink-0 rounded-full"
+            />
+          ) : selectedWorkflow ? (
+            <WorkflowMark />
+          ) : selected ? (
+            <AgentAvatar
+              agentId={selected.id}
+              slug={selected.slug}
+              hasAvatar={selected.has_avatar}
+              colorSlot={selected.avatar_color}
+              size="sm"
+            />
+          ) : (
+            <span className="bg-foreground/8 flex h-6 w-6 items-center justify-center rounded-full">
+              <Bot className="h-3 w-3" />
+            </span>
+          )}
+          <span className="max-w-[160px] truncate text-sm font-medium">
+            {isLoading && !selected && !selectedWorkflow ? (
+              <Skeleton data-testid="agent-picker-loading-name" className="h-3.5 w-20 rounded" />
+            ) : (
+              (answererName ?? t("none"))
+            )}
+          </span>
+          <ChevronDown
+            aria-hidden
+            className="text-muted-foreground h-3 w-3 transition-transform group-data-[state=open]/agent:rotate-180 motion-reduce:transition-none"
+          />
+        </button>
+      </PopoverTrigger>
+
+      <PopoverContent
+        align="start"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          options.current?.focus();
+        }}
+        sideOffset={8}
+        className="border-border bg-popover w-[300px] rounded-xl border p-1.5 shadow-md"
+      >
+        {/* One line, and the smallest type in the menu. It is a footnote about when the
+            change takes effect; at twelve pixels over two lines it was the loudest
+            thing in a list of agents. */}
+        <p className="text-muted-foreground border-foreground/8 mb-1 border-b px-2 pt-1 pb-2 text-xs leading-snug">
+          {currentConversationId ? t("appliesNext") : t("whoAnswers")}
+        </p>
+
+        <div
+          ref={options}
+          tabIndex={-1}
+          onKeyDown={(event) => {
+            if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+            const buttons = Array.from(
+              event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'),
+            );
+            if (!buttons.length) return;
+            event.preventDefault();
+            const current = buttons.findIndex((button) => button === document.activeElement);
+            const next =
+              event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? buttons.length - 1
+                  : current < 0
+                    ? event.key === "ArrowUp"
+                      ? buttons.length - 1
+                      : 0
+                    : (current + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) %
+                      buttons.length;
+            buttons[next]?.focus();
+          }}
+          role="radiogroup"
+          aria-label={t("label")}
+          // Scrolls on its own, under the line that says what it is, so an
+          // organization with many agents does not run the menu off the screen.
+          className="max-h-[min(60vh,26rem)] scrollbar-thin space-y-px overflow-y-auto outline-none"
+        >
+          {runnable.map((agent) => (
+            <AgentOption
+              key={agent.id}
+              agent={agent}
+              selected={selectedWorkflow === null && selectedAgentId === agent.id}
+              isDefault={defaultAgentId === agent.id}
+              onSelect={() => selectAgent(agent.id)}
+              onToggleDefault={() => setDefaultAgent(defaultAgentId === agent.id ? null : agent.id)}
+            />
+          ))}
+        </div>
+
+        {chattable.length > 0 && (
+          <>
+            <p className="text-muted-foreground border-foreground/8 mt-1 border-t px-2 pt-2 pb-1 text-[11px]">
+              {t("workflows")}
+            </p>
+            <div role="radiogroup" aria-label={t("workflows")} className="space-y-px">
+              {chattable.map((workflow) => (
+                <WorkflowOption
+                  key={workflow.id}
+                  workflow={workflow}
+                  selected={selectedWorkflow?.id === workflow.id}
+                  onSelect={() => selectWorkflow(workflow.id)}
+                />
+              ))}
+            </div>
+          </>
+        )}
+
+        {isLoading && runnable.length === 0 ? (
+          <p className="text-muted-foreground px-2 py-3 text-xs">{t("loading")}</p>
+        ) : (
+          runnable.length === 0 && (
+            <p className="text-muted-foreground px-2 py-3 text-xs leading-relaxed">
+              {t("nonePublished")}
+            </p>
+          )
+        )}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function AgentOption({
+  agent,
+  selected,
+  isDefault,
+  onSelect,
+  onToggleDefault,
+}: {
+  agent: Agent;
+  selected: boolean;
+  isDefault: boolean;
+  onSelect: () => void;
+  onToggleDefault: () => void;
+}) {
+  const t = useTranslations("chat.agentPicker");
+  // Two buttons that read as one row: a button cannot contain a button, and starring an
+  // agent must not also select it - so the *wrapper* carries the fill and the rounding,
+  // and the star lives inside it rather than in an orphaned column beside it. What this
+  // replaces gave every agent its own bordered card inside an already bordered popover,
+  // which is four nested boxes to say "pick one of these".
+  return (
+    <div
+      className={cn(
+        "group flex items-center rounded-lg pr-1 transition-colors",
+        selected ? "bg-accent" : "hover:bg-accent/60",
+      )}
+    >
+      <button
+        type="button"
+        role="radio"
+        aria-checked={selected}
+        onClick={onSelect}
+        className="focus-visible:ring-ring flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2 py-1.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset"
+      >
+        <AgentAvatar
+          agentId={agent.id}
+          slug={agent.slug}
+          hasAvatar={agent.has_avatar}
+          colorSlot={agent.avatar_color}
+          size="sm"
+        />
+        <span className="min-w-0 flex-1">
+          <span className="flex items-center gap-1.5">
+            <span className="truncate text-[13px] font-medium">{agent.name}</span>
+            {isDefault && (
+              <span className="text-muted-foreground shrink-0 text-xs">{t("default")}</span>
+            )}
+          </span>
+          {/* One line, truncated. Wrapped to two, a description made every row a
+              different height and the list stopped scanning as a list. */}
+          {agent.description && (
+            <span className="text-muted-foreground block truncate text-xs">
+              {agent.description}
+            </span>
+          )}
+        </span>
+        {selected && <Check className="text-foreground h-3.5 w-3.5 shrink-0" aria-hidden />}
+      </button>
+      <button
+        type="button"
+        aria-pressed={isDefault}
+        aria-label={
+          isDefault
+            ? t("unsetDefault", { name: agent.name })
+            : t("setDefault", { name: agent.name })
+        }
+        title={isDefault ? t("defaultForNewChats") : t("makeDefaultForNewChats")}
+        onClick={onToggleDefault}
+        className={cn(
+          "shrink-0 rounded-md p-1.5 transition-colors",
+          // Off-state stars on every row are four grey outlines competing with the
+          // names; the one that is set is the only one worth showing unasked.
+          isDefault
+            ? "text-foreground"
+            : "text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
+        )}
+      >
+        <Star className={cn("h-3.5 w-3.5", isDefault && "fill-current")} />
+      </button>
+    </div>
+  );
+}
+
+function WorkflowMark() {
+  return (
+    <span className="flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-300">
+      <Workflow aria-hidden="true" className="h-3.5 w-3.5" />
+    </span>
+  );
+}
+
+function WorkflowOption({
+  workflow,
+  selected,
+  onSelect,
+}: {
+  workflow: WorkflowRead;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      onClick={onSelect}
+      className={cn(
+        "flex w-full min-w-0 items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors",
+        selected ? "bg-accent" : "hover:bg-accent/60",
+      )}
+    >
+      <WorkflowMark />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[13px] font-medium">{workflow.name}</span>
+        {workflow.description && (
+          <span className="text-muted-foreground block truncate text-[11px]">
+            {workflow.description}
+          </span>
+        )}
+      </span>
+      {selected && <Check className="text-foreground h-3.5 w-3.5 shrink-0" aria-hidden />}
+    </button>
+  );
+}

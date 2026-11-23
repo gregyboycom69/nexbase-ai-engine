@@ -1,0 +1,77 @@
+# Traefik for a host that does not already have one:
+#
+#   docker network create traefik_webgateway
+#   docker compose --env-file backend/.env -f docker-compose-traefik.yml up -d
+#
+# Skip it where Traefik is already running - point `TRAEFIK_NETWORK` at the
+# network it watches instead, and the overlays find it. See `docs/deploy.md`.
+#
+# The network is created by hand rather than by this file, and declared external
+# here, because the application stack joins it too: a network owned by whichever
+# compose project happened to start first is a network that disappears when that
+# project is brought down.
+
+networks:
+  traefik_webgateway:
+    name: ${TRAEFIK_NETWORK:-traefik_webgateway}
+    external: true
+
+services:
+  traefik:
+    image: traefik:v3.7
+    container_name: traefik_proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    # One static source: a mounted traefik.yml would make Traefik ignore these
+    # arguments too. CLI preserves the case-sensitive RequestPath map key;
+    # environment parsing lowercases it, silently leaving credential paths logged.
+    command:
+      - --global.sendanonymoususage=false
+      - --api.dashboard=true
+      - --api.insecure=false
+      - --ping=true
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
+      - --providers.docker.watch=true
+      # New services stay private until they opt in with traefik.enable=true.
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${TRAEFIK_NETWORK:-traefik_webgateway}
+      - --log.level=INFO
+      - --log.format=common
+      - --accesslog=true
+      - --accesslog.format=common
+      # RequestPath includes query strings. Both can contain credentials.
+      - --accesslog.fields.names.RequestPath=drop
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.websecure.http.middlewares=security-headers@file
+      - --entrypoints.websecure.http.tls.certresolver=letsencrypt
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:?ACME_EMAIL is required, e.g. ops@example.com}
+      - --certificatesresolvers.letsencrypt.acme.storage=/certificates/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+    volumes:
+      # Container discovery needs daemon access. A read-only bind mount does
+      # not restrict Docker API operations: treat this proxy as host-privileged.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      # The issued certificates and the account key. A named volume rather than a
+      # bind mount because Traefik requires the file be readable by nobody else,
+      # and a bind-mounted file inherits whatever the host gave it.
+      - traefik_certificates:/certificates
+    networks:
+      - traefik_webgateway
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  traefik_certificates:

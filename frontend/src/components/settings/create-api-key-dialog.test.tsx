@@ -1,0 +1,240 @@
+import { useState } from "react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { CreateApiKeyDialog } from "./create-api-key-dialog";
+import type { ApiKeyCreated, ApiKeyScopeCatalog } from "@/types/api-keys";
+
+const toastError = vi.fn();
+vi.mock("@/components/public-config/public-config-provider", () => ({
+  usePublicConfig: () => ({ apiUrl: "https://api.example" }),
+}));
+vi.mock("sonner", () => ({ toast: { error: (...args: unknown[]) => toastError(...args) } }));
+
+const CATALOG: ApiKeyScopeCatalog = {
+  scopes: [
+    "agents:view",
+    "agents:run",
+    "collections:view",
+    "collections:edit",
+    "personal:consent",
+    "mcp:personal:use",
+  ],
+  presets: [
+    { id: "read_only", scopes: ["agents:view", "collections:view"] },
+    { id: "knowledge_ingest", scopes: ["collections:view", "collections:edit"] },
+  ],
+};
+
+const CREATED: ApiKeyCreated = {
+  id: "k1",
+  name: "Nightly import",
+  prefix: "aos_0123abcd",
+  scopes: ["agents:view", "collections:view"],
+  user_id: "u1",
+  issuer_email: "ada@example.com",
+  status: "active",
+  expires_at: null,
+  last_used_at: null,
+  revoked_at: null,
+  created_at: "2026-10-09T10:00:00Z",
+  key: "aos_0123abcdsecret",
+};
+
+function open(onCreate = vi.fn().mockResolvedValue(CREATED), onOpenChange = vi.fn()) {
+  render(
+    <CreateApiKeyDialog
+      open
+      onOpenChange={onOpenChange}
+      catalog={CATALOG}
+      onCreate={onCreate}
+      busy={false}
+    />,
+  );
+  return { onCreate, onOpenChange };
+}
+
+async function pick(label: string, option: string) {
+  await userEvent.click(screen.getByLabelText(label));
+  await userEvent.click(await screen.findByRole("option", { name: option }));
+}
+
+describe("CreateApiKeyDialog", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("issues the first preset by default and then shows the key, once", async () => {
+    const { onCreate, onOpenChange } = open();
+
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+    await userEvent.type(screen.getByLabelText("Name"), "Nightly import");
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    const [sent] = onCreate.mock.lastCall ?? [];
+    expect(sent?.scopes).toEqual(["agents:view", "collections:view"]);
+    expect(new Date(sent?.expires_at ?? 0).getTime()).toBeGreaterThan(Date.now());
+    expect(await screen.findByDisplayValue("aos_0123abcdsecret")).toBeInTheDocument();
+    // The key goes to the API's origin, never to the console's proxy.
+    expect(
+      screen.getByText(/https:\/\/api\.example\/api\/v1\/me\/permissions/),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("issues exactly the permissions ticked under Custom, with no expiry when asked", async () => {
+    const { onCreate } = open();
+
+    await userEvent.type(screen.getByLabelText("Name"), "ci");
+    await pick("Access", "Custom");
+    expect(screen.getByRole("button", { name: "Create" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("checkbox", { name: "collections:edit" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "agents:view" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "agents:view" }));
+    await pick("Expires", "Never");
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    expect(onCreate).toHaveBeenCalledWith({
+      name: "ci",
+      scopes: ["collections:edit"],
+      expires_at: null,
+    });
+  });
+
+  it("requires an explicit choice to delegate personal MCP", async () => {
+    const { onCreate } = open();
+    expect(screen.getByText(/Personal MCP delegation is excluded/)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Name"), "opencode");
+    await pick("Access", "Custom");
+    const personal = screen.getByRole("checkbox", { name: "mcp:personal:use" });
+    expect(personal).not.toBeChecked();
+    await userEvent.click(personal);
+    await userEvent.click(screen.getByRole("checkbox", { name: "agents:run" }));
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+    expect(onCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "opencode",
+        scopes: ["mcp:personal:use", "agents:run"],
+      }),
+    );
+  });
+
+  it("keeps the form and toasts the refusal when the server says no", async () => {
+    open(vi.fn().mockRejectedValue(new Error("refused")));
+
+    await userEvent.type(screen.getByLabelText("Name"), "ci");
+    await pick("Access", "Knowledge ingest");
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    expect(toastError).toHaveBeenCalled();
+    expect(screen.getByLabelText("Name")).toHaveValue("ci");
+  });
+
+  it("offers Custom alone to a caller with no preset", () => {
+    render(
+      <CreateApiKeyDialog
+        open
+        onOpenChange={vi.fn()}
+        catalog={{ scopes: ["agents:view"], presets: [] }}
+        onCreate={vi.fn()}
+        busy={false}
+      />,
+    );
+
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+  });
+});
+
+it("requires explicit Custom opt-in for personal consent", async () => {
+  const { onCreate } = open();
+  await userEvent.click(screen.getByRole("button", { name: "View 2 permissions" }));
+  expect(screen.getByText(/Personal consent is excluded from presets/)).toBeInTheDocument();
+  await userEvent.type(screen.getByLabelText("Name"), "Personal routines");
+  await pick("Access", "Custom");
+  const consent = screen.getByRole("checkbox", { name: "personal:consent" });
+  expect(consent).not.toBeChecked();
+  await userEvent.click(consent);
+  await userEvent.click(screen.getByRole("button", { name: "Create" }));
+  expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ scopes: ["personal:consent"] }));
+});
+
+it("retains custom selections across search and an in-flight refusal, blocking dismissal", async () => {
+  const held = Promise.withResolvers<ApiKeyCreated>();
+  const create = vi
+    .fn()
+    .mockImplementationOnce(() => held.promise)
+    .mockResolvedValue(CREATED);
+  const close = vi.fn();
+  function Harness() {
+    const [busy, setBusy] = useState(false);
+    return (
+      <CreateApiKeyDialog
+        open
+        catalog={CATALOG}
+        busy={busy}
+        onOpenChange={close}
+        onCreate={async (input) => {
+          setBusy(true);
+          try {
+            return await create(input);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      />
+    );
+  }
+  render(<Harness />);
+  await userEvent.type(screen.getByLabelText("Name"), "Support sync");
+  await pick("Access", "Custom");
+  await userEvent.click(screen.getByRole("checkbox", { name: "agents:view" }));
+  await userEvent.type(screen.getByLabelText("Find a permission"), "collections");
+  expect(screen.queryByRole("checkbox", { name: "agents:view" })).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("checkbox", { name: "collections:view" }));
+  await userEvent.clear(screen.getByLabelText("Find a permission"));
+  expect(screen.getByRole("checkbox", { name: "agents:view" })).toBeChecked();
+  await pick("Expires", "Never");
+  await userEvent.click(screen.getByRole("button", { name: "Create" }));
+  expect(screen.getByLabelText("Name")).toBeDisabled();
+  expect(screen.getByLabelText("Find a permission")).toBeDisabled();
+  expect(screen.getByRole("checkbox", { name: "agents:view" })).toBeDisabled();
+  expect(screen.getByLabelText("Access", { selector: "button" })).toBeDisabled();
+  expect(screen.getByLabelText("Expires")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Close" })).toBeDisabled();
+  await userEvent.keyboard("{Escape}");
+  expect(close).not.toHaveBeenCalled();
+  held.reject(new Error("refused"));
+  await waitFor(() => expect(screen.getByLabelText("Name")).toBeEnabled());
+  expect(screen.getByLabelText("Name")).toHaveValue("Support sync");
+  expect(screen.getByLabelText("Expires")).toHaveTextContent("Never");
+  expect(screen.getByRole("checkbox", { name: "agents:view" })).toBeChecked();
+  await userEvent.click(screen.getByRole("button", { name: "Create" }));
+  await screen.findByRole("heading", { name: "Copy your key" });
+  expect(create).toHaveBeenLastCalledWith({
+    name: "Support sync",
+    scopes: ["agents:view", "collections:view"],
+    expires_at: null,
+  });
+});
+
+it("submits the name with Enter while Enter in permission search leaves the form intact", async () => {
+  const { onCreate } = open();
+  await userEvent.type(screen.getByLabelText("Name"), "Keyboard key");
+  await pick("Access", "Custom");
+  await userEvent.click(screen.getByRole("checkbox", { name: "agents:view" }));
+  await userEvent.type(screen.getByLabelText("Find a permission"), "agents{Enter}");
+  expect(onCreate).not.toHaveBeenCalled();
+  await userEvent.type(screen.getByLabelText("Name"), "{Enter}");
+  await screen.findByRole("heading", { name: "Copy your key" });
+  expect(onCreate).toHaveBeenCalledOnce();
+  expect(onCreate).toHaveBeenCalledWith(
+    expect.objectContaining({ name: "Keyboard key", scopes: ["agents:view"] }),
+  );
+});
+
+it("refuses a form submission without a key name", () => {
+  const { onCreate } = open();
+  fireEvent.submit(screen.getByRole("form"));
+  expect(onCreate).not.toHaveBeenCalled();
+});

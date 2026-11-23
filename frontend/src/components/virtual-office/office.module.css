@@ -1,0 +1,372 @@
+﻿.headquarters,
+.viewport {
+  --sky: #dce8ff;
+  --sky-edge: #eef4ff;
+  --grid: #405da019;
+  --floor: #748ead;
+  --base: #4b6383;
+  --wall: #eaf5ff;
+  --wall-shadow: #7790ae;
+  --floor-shadow: #24385755;
+  --ink: #131e39;
+  --desk: #f6e0bc;
+  --screens: #253f65;
+  --art-glow: #fff7;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at 46% 40%, var(--art-glow), transparent 60%),
+    repeating-linear-gradient(90deg, var(--grid) 0 1px, transparent 1px 2rem),
+    repeating-linear-gradient(var(--grid) 0 1px, transparent 1px 2rem),
+    linear-gradient(153deg, var(--sky), var(--sky-edge));
+  color: var(--ink);
+}
+
+:global(.dark) .headquarters,
+:global(.dark) .viewport {
+  --sky: #101a36;
+  --sky-edge: #151238;
+  --grid: #9bb4ff19;
+  --floor: #435579;
+  --base: #273658;
+  --wall: #c1cced;
+  --wall-shadow: #63719f;
+  --floor-shadow: #0207139c;
+  --ink: #f1f5ff;
+  --desk: #e0bd92;
+  --screens: #1f365a;
+  --art-glow: #33428c88;
+}
+
+.headquarters {
+  display: grid;
+  height: 100%;
+  grid-template-rows: minmax(0, 1fr) auto;
+  border: 1px solid var(--grid);
+  border-radius: 1.75rem;
+}
+
+.model,
+.viewport {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  container-type: inline-size;
+}
+
+.modelFloat,
+.camera {
+  display: grid;
+  width: min(76cqw, 37rem);
+  aspect-ratio: 1.45;
+  place-items: center;
+}
+
+.modelFloat {
+  animation: headquarters-float 6s ease-in-out 1;
+}
+
+.modelFloat .windows {
+  animation: headquarters-glass 3s ease-in-out 2 alternate;
+}
+
+.headquartersCopy {
+  position: relative;
+  padding: 0 1.5rem clamp(1rem, 6vh, 3.75rem);
+  text-align: center;
+}
+
+.headquartersTitle {
+  font-size: clamp(1.6rem, 3vw, 3.1rem);
+  font-weight: 750;
+  line-height: 1.05;
+  letter-spacing: -0.055em;
+  text-wrap: balance;
+}
+
+.headquartersTagline {
+  max-width: 38ch;
+  margin: 0.75rem auto 0;
+  font-size: clamp(0.875rem, 1.2vw, 1.125rem);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.viewport {
+  height: clamp(16rem, 52vw, 33rem);
+  border: 1px solid var(--grid);
+  border-radius: 1rem;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.viewport[data-dragging] {
+  cursor: grabbing;
+}
+
+.camera {
+  transition: transform 330ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.viewport[data-dragging] .camera {
+  transition: none;
+}
+
+.floor {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  grid-template: 1fr 1fr / 1fr 16% 1fr;
+  gap: 4%;
+  padding: 4%;
+  border: 1px solid #b1cce898;
+  border-radius: 6%;
+  background: var(--floor);
+  box-shadow:
+    -0.35rem 0.55rem var(--base),
+    -0.7rem 1.1rem var(--base),
+    -1rem 1.6rem 2rem var(--floor-shadow);
+  transform: rotateX(43deg) rotateZ(-30deg);
+}
+
+.room {
+  --room-tone: #b7d7e4;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid #ffffff6b;
+  border-top: 0.43rem solid var(--wall);
+  border-left: 0.43rem solid var(--wall-shadow);
+  border-radius: 0.32rem;
+  background:
+    repeating-linear-gradient(90deg, #263c4b13 0 1px, transparent 1px 11%), var(--room-tone);
+  box-shadow: 0 0.2rem #1d365a50;
+}
+
+.room[data-room="operations"] {
+  --room-tone: #d0c8ee;
+  grid-area: 1 / 3;
+}
+
+.room[data-room="studio"] {
+  --room-tone: #dce5b8;
+  grid-area: 2 / 1;
+}
+
+.room[data-room="meeting"] {
+  --room-tone: #cbdaf7;
+  grid-area: 2 / 3;
+}
+
+button.room:hover,
+button.room:focus-visible,
+button.room[aria-pressed="true"] {
+  outline: 0.2rem solid #4f46e5;
+  outline-offset: 0.16rem;
+  cursor: pointer;
+}
+
+.corridor {
+  grid-area: 1 / 2 / 3;
+  border-inline: 1px dashed #dfedff80;
+  background: repeating-linear-gradient(0deg, #e3f0ff40 0 1px, transparent 1px 12%);
+  pointer-events: none;
+}
+
+.entrance {
+  position: absolute;
+  left: 42%;
+  bottom: -4%;
+  width: 16%;
+  height: 7%;
+  border: 1px solid #fff8;
+  border-radius: 0.2rem;
+  background: #89b7de;
+  box-shadow: 0 0.2rem var(--base);
+  pointer-events: none;
+}
+
+.furnishings,
+.windows,
+.rug,
+.plant,
+.meetingTable,
+.desks {
+  position: absolute;
+  pointer-events: none;
+}
+
+.furnishings {
+  inset: 0;
+}
+
+.windows {
+  top: -0.38rem;
+  inset-inline: 13%;
+  height: 0.28rem;
+  background: repeating-linear-gradient(90deg, #7cb8e3 0 27%, transparent 27% 34%);
+  box-shadow: 0 0.1rem #f5fbffb8;
+}
+
+.rug {
+  inset: 22% 12% 17%;
+  border: 1px solid #43598055;
+  border-radius: 0.45rem;
+  background: #f7fbff6c;
+}
+
+.plant {
+  right: 5%;
+  top: 10%;
+  width: 9%;
+  aspect-ratio: 1;
+  border: 1px solid #bed9bb;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #9dd090, #387c61 66%);
+  box-shadow: 0 0.16rem #31544487;
+}
+
+.desks {
+  inset: 29% 22% 24% 14%;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 11%;
+}
+
+.desks > span,
+.meetingTable {
+  position: relative;
+  height: 62%;
+  border: 1px solid #fff5;
+  border-radius: 0.16rem;
+  background: var(--desk);
+  box-shadow:
+    0 0.25rem #816b53,
+    0 0.5rem #3842542a;
+}
+
+.desks > span::before,
+.desks > span::after {
+  position: absolute;
+  inset-inline: 15%;
+  height: 24%;
+  border-radius: 0.1rem;
+  background: var(--screens);
+  content: "";
+}
+
+.desks > span::before {
+  top: 12%;
+  border-top: 1px solid #89d6f4;
+  box-shadow: 0 0.12rem #142743;
+}
+
+.desks > span::after {
+  inset-inline: 23%;
+  bottom: -68%;
+  border-radius: 0.2rem 0.2rem 36% 36%;
+  background: #436c84;
+  box-shadow: 0 0.18rem #263e62;
+}
+
+.meetingTable {
+  position: absolute;
+  inset: 33% 23% auto;
+  height: 31%;
+  border-radius: 40%;
+}
+
+.meetingTable::after {
+  position: absolute;
+  inset: -34% 10%;
+  border-block: 0.23rem dotted var(--screens);
+  content: "";
+}
+
+.roomLabel {
+  position: absolute;
+  right: 5%;
+  bottom: 3%;
+  left: 5%;
+  color: #14213b;
+  font-size: clamp(0.42rem, 1.55cqw, 0.76rem);
+  font-weight: 700;
+  line-height: 1.1;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+@keyframes headquarters-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-0.6rem);
+  }
+}
+
+@keyframes headquarters-glass {
+  from {
+    opacity: 0.62;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-height: 38rem) {
+  .modelFloat {
+    width: min(65cqw, 54vh);
+  }
+}
+
+:global([data-motion="reduce"]) .modelFloat,
+:global([data-motion="reduce"]) .modelFloat .windows {
+  animation: none;
+}
+
+:global([data-motion="reduce"]) .camera {
+  transition: none;
+}
+
+.seats {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  justify-content: space-evenly;
+  align-items: center;
+  place-self: stretch;
+  padding-inline: 7%;
+  pointer-events: none;
+}
+
+.seats[data-room="research"] { grid-area: 1 / 1; }
+.seats[data-room="operations"] { grid-area: 1 / 3; }
+.seats[data-room="studio"] { grid-area: 2 / 1; }
+
+.employeeMarker {
+  display: grid;
+  width: 31%;
+  min-height: 44px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  transform: rotateZ(30deg);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.employeeMarker:is(:hover, :focus-visible, [aria-pressed="true"]) {
+  border-color: #5147c1;
+  outline: 1px solid #5147c1;
+  background: #edeaff;
+}
+
+@container (max-width: 25rem) {
+  .employeeMarker > span { transform: scale(0.68); }
+}

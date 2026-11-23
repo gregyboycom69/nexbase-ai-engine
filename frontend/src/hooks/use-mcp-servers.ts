@@ -1,0 +1,173 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import { apiClient } from "@/lib/api-client";
+import type { McpToolInfo } from "@/lib/mcp-connections-api";
+import { mergeServers, type McpServerRow } from "@/lib/mcp-servers";
+import { qk } from "@/lib/query-keys";
+import { DASHBOARD_FRESHNESS } from "@/lib/query-freshness";
+import type { McpCatalog, McpServerStateFilter, PlatformMcpToolList } from "@/types/mcp";
+import { Perm } from "@/types/permissions";
+import { usePermissions } from "./use-permissions";
+import { useMcpConnections } from "./use-mcp-connections";
+import { useOrgMcpConnections } from "./use-org-mcp-connections";
+
+/**
+ * The organization's MCP catalog.
+ *
+ * Cached indefinitely: the list is hand-curated in the backend and changes when
+ * it is redeployed, not while someone is reading it.
+ */
+export function useMcpCatalog() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.mcpServers.catalog(),
+    queryFn: () => apiClient.get<McpCatalog>("/agents/mcp-catalog"),
+    staleTime: Infinity,
+  });
+  return { servers: data?.items ?? [], isLoading, error };
+}
+
+/**
+ * One server by its key: curated, mirrored or a saved custom server. Entries
+ * outside the curated catalog use bounded lookups. Null while looking and
+ * when a bookmarked key no longer names an accessible server.
+ */
+export function useMcpServerEntry(key: string | null) {
+  const { servers, isLoading: catalogLoading } = useMcpCatalog();
+  const curated = key === null ? null : (servers.find((server) => server.key === key) ?? null);
+  const mirrored = useQuery({
+    queryKey: qk.mcpServers.entry(key ?? ""),
+    queryFn: async () => {
+      const path = `/agents/mcp-servers?q=${encodeURIComponent(key ?? "")}&limit=10`;
+      const listed = await apiClient.get<McpCatalog>(path);
+      if (listed.items.some((server) => server.key === key)) return listed;
+      // Saved accounts stay manageable even when a failed audit hides their
+      // registry entry from browsing. Do not turn a bookmark into a dead end.
+      return apiClient.get<McpCatalog>(`${path}&state=connected`);
+    },
+    enabled: key !== null && !catalogLoading && curated === null,
+    ...DASHBOARD_FRESHNESS,
+  });
+  const entry = curated ?? mirrored.data?.items.find((server) => server.key === key) ?? null;
+  return { entry, isLoading: entry === null && (catalogLoading || mirrored.isLoading) };
+}
+
+/**
+ * The tools of this deployment's own MCP server, for a platform binding to pick from.
+ *
+ * Cached indefinitely for the same reason as the catalog: they change on redeploy.
+ */
+export function usePlatformMcpTools({ enabled = true }: { enabled?: boolean } = {}) {
+  const { data, isLoading, error } = useQuery({
+    queryKey: qk.mcpServers.platformTools(),
+    queryFn: () => apiClient.get<PlatformMcpToolList>("/agents/platform-mcp-tools"),
+    staleTime: Infinity,
+    enabled,
+  });
+  return { tools: data?.items ?? [], isLoading, error };
+}
+
+/** What one page of the server list holds. */
+export const MCP_PAGE_SIZE = 50;
+
+/**
+ * One page of the MCP list, filtered before paging with accessible saved accounts.
+ *
+ * A request rather than a filter, which is the opposite of what this page used
+ * to do. The curated hundred could be held and filtered in the browser; the
+ * 5,703 registry rows behind them cannot, and merging two paged sources in the
+ * browser means the browser working out which page of which source a page of the
+ * list needs. The server joins them and answers with rows.
+ *
+ * `registryTotal` is what the mirror holds, which the count line needs to say
+ * what the list reaches - zero until `agenticos cmd mcp-registry-sync` has run.
+ */
+export function useMcpCatalogPage(
+  query: string,
+  category: string,
+  auth: string,
+  page: number,
+  enabled = true,
+  state: McpServerStateFilter = "all",
+) {
+  const needle = query.trim();
+  const { data, isLoading, isFetching, isPlaceholderData, error, refetch } = useQuery({
+    queryKey: qk.mcpServers.listPage(needle, category, auth, page, state),
+    enabled,
+    queryFn: () =>
+      apiClient.get<McpCatalog>(
+        `/agents/mcp-servers?q=${encodeURIComponent(needle)}` +
+          `&category=${encodeURIComponent(category)}` +
+          `&auth=${encodeURIComponent(auth)}` +
+          `&state=${state}` +
+          `&skip=${page * MCP_PAGE_SIZE}&limit=${MCP_PAGE_SIZE}`,
+      ),
+    ...DASHBOARD_FRESHNESS,
+  });
+  return {
+    servers: data?.items ?? [],
+    total: data?.total ?? 0,
+    registryTotal: data?.registry_total ?? 0,
+    isLoading,
+    isFetching,
+    isPlaceholderData,
+    error,
+    refetch,
+  };
+}
+
+export type { McpServerRow };
+
+/**
+ * Every MCP server, with who has connected it and what it offers.
+ *
+ * One hook for what used to be two pages. The catalog says which servers exist;
+ * the two connection lists say who holds a credential to each. Presenting those
+ * as separate screens is what made the difference between them unanswerable, so
+ * they are joined here and the page renders rows.
+ *
+ * Probe results are held in local state rather than the query cache because
+ * they are not a resource anyone can GET - they exist only as the answer to a
+ * check somebody asked for. The lists, which a check does change server-side,
+ * are refetched by the hook that owns them.
+ */
+export function useMcpServers({ retryOnMount = true }: { retryOnMount?: boolean } = {}) {
+  const { can, isLoading: permissionsLoading } = usePermissions();
+  const catalog = useQuery({
+    queryKey: qk.mcpServers.catalog(),
+    queryFn: () => apiClient.get<McpCatalog>("/agents/mcp-catalog"),
+    staleTime: Infinity,
+  });
+  const organization = useOrgMcpConnections({ enabled: can(Perm.mcpManage), retryOnMount });
+  const personal = useMcpConnections();
+
+  const [toolsByConnection, setToolsByConnection] = useState<Record<string, McpToolInfo[]>>({});
+
+  const rows = useMemo(
+    () => mergeServers(catalog.data?.items ?? [], organization.connections, personal.connections),
+    [catalog.data, organization.connections, personal.connections],
+  );
+
+  return {
+    rows,
+    isLoading:
+      permissionsLoading || catalog.isLoading || organization.isLoading || personal.isLoading,
+    /**
+     * A failure everybody's view depends on is reported — the catalog and the
+     * caller's own connections. The organization list's is not: its failure
+     * must not prevent managing a personal account. Members without
+     * `mcp:manage` do not request that list at all. A failed catalog is the
+     * opposite case — without it `mergeServers` yields an empty page dressed
+     * as "no servers", on the one deployment state that cannot be true.
+     */
+    error: catalog.error ?? personal.error,
+    organization,
+    personal,
+    /** Tools discovered by a check in this session, keyed by connection id. */
+    toolsByConnection,
+    recordTools: (connectionId: string, tools: McpToolInfo[]) =>
+      setToolsByConnection((previous) => ({ ...previous, [connectionId]: tools })),
+  };
+}

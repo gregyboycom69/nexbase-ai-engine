@@ -1,0 +1,333 @@
+"""A retried channel delivery is answered once (#167).
+
+Every platform delivers at-least-once: a 200 lost on the wire is followed by
+a redelivery that is valid, signed and new. The claim in
+`app.services.channels.dedupe` is the single defence, taken by the router at
+the one point all six inbound paths cross - so the redelivery test here
+asserts at the `process_channel_event` boundary, not on the claim alone.
+"""
+
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from app.clients.redis import RedisClient
+from app.services.channels import dedupe
+from app.services.channels.base import IncomingMessage
+from app.services.channels.router import ChannelMessageRouter
+from app.worker.background.channel import process_channel_event
+
+pytestmark = pytest.mark.anyio
+
+
+def _message(**overrides: Any) -> IncomingMessage:
+    defaults: dict[str, Any] = {
+        "platform": "slack",
+        "bot_id": "bot-1",
+        "platform_user_id": "U1",
+        "platform_chat_id": "C1",
+        "chat_type": "channel",
+        "text": "hello",
+        "message_id": "1723300000.000100",
+    }
+    defaults.update(overrides)
+    return IncomingMessage(**defaults)
+
+
+class _FakeRedis:
+    """The two Redis behaviours this module depends on: SET NX, and DEL."""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int | None] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str, ttl: int | None = None, nx: bool = False) -> bool:
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        self.ttls[key] = ttl
+        return True
+
+    async def delete(self, key: str) -> int:
+        self.ttls.pop(key, None)
+        return int(self.store.pop(key, None) is not None)
+
+
+class _BrokenRedis:
+    """A Redis that cannot be reached mid-flight."""
+
+    async def get(self, key: str) -> str | None:
+        raise ConnectionError("redis unreachable")
+
+    async def set(self, key: str, value: str, ttl: int | None = None, nx: bool = False) -> bool:
+        raise ConnectionError("redis unreachable")
+
+    async def delete(self, key: str) -> int:
+        raise ConnectionError("redis unreachable")
+
+
+@pytest.fixture(autouse=True)
+def _unconfigured_after() -> Any:
+    """Every test leaves the module the way an unstarted app finds it."""
+    yield
+    dedupe.configure(None)
+
+
+@pytest.fixture
+def fake_redis() -> _FakeRedis:
+    redis = _FakeRedis()
+    dedupe.configure(cast(RedisClient, redis))
+    return redis
+
+
+async def test_the_same_delivery_is_claimed_once(fake_redis: _FakeRedis) -> None:
+    incoming = _message()
+
+    assert await dedupe.claim_delivery(incoming) is True
+    assert await dedupe.claim_delivery(incoming) is False
+
+    # The claim expires - the keyspace tracks recent traffic, not history.
+    assert list(fake_redis.ttls.values()) == [dedupe.SEEN_TTL_SECONDS]
+
+
+async def test_two_concurrent_deliveries_exactly_one_proceeds(fake_redis: _FakeRedis) -> None:
+    """The claim goes through SET NX - the fake has no `get` to race on. What a
+    real interleaving would do to a get-then-set is Redis's contract, asserted
+    on the wrapper in `test_clients.py`."""
+    incoming = _message()
+
+    results = await asyncio.gather(
+        dedupe.claim_delivery(incoming),
+        dedupe.claim_delivery(incoming),
+    )
+
+    assert sorted(results) == [False, True]
+
+
+async def test_chats_sharing_a_message_id_do_not_collide(fake_redis: _FakeRedis) -> None:
+    """Telegram numbers messages per chat and Slack's ts is per channel, so
+    the chat id is part of the key - a bot-wide key would let one chat's
+    message swallow another's."""
+    assert await dedupe.claim_delivery(_message(platform_chat_id="C1", message_id="5")) is True
+    assert await dedupe.claim_delivery(_message(platform_chat_id="C2", message_id="5")) is True
+
+
+async def test_a_message_with_no_message_id_is_processed_and_logged(
+    fake_redis: _FakeRedis, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The documented policy: no platform message id means no claim - both
+    deliveries process, because dropping a legitimate question is worse than
+    answering a redelivered one twice - and the log says the guarantee is off."""
+    incoming = _message(message_id=None)
+
+    with caplog.at_level("WARNING"):
+        assert await dedupe.claim_delivery(incoming) is True
+        assert await dedupe.claim_delivery(incoming) is True
+
+    assert fake_redis.store == {}
+    assert "no message_id" in caplog.text
+
+
+async def test_unconfigured_dedupe_processes_rather_than_drops(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dedupe.configure(None)
+
+    with caplog.at_level("WARNING"):
+        assert await dedupe.claim_delivery(_message()) is True
+
+    assert "not configured" in caplog.text
+
+
+async def test_a_redis_error_processes_rather_than_drops(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    dedupe.configure(cast(RedisClient, _BrokenRedis()))
+
+    with caplog.at_level("WARNING"):
+        assert await dedupe.claim_delivery(_message()) is True
+
+    assert "channel_dedupe_redis_unavailable" in caplog.text
+
+
+async def test_a_redelivered_event_reaches_the_router_once(fake_redis: _FakeRedis) -> None:
+    """The acceptance boundary from #167: the same IncomingMessage delivered
+    twice through `process_channel_event` produces one run - everything past
+    the claim (the agent call, the spend record, the reply) happens once."""
+    incoming = _message()
+    inner = AsyncMock()
+
+    @asynccontextmanager
+    async def _db() -> Any:
+        yield AsyncMock()
+
+    with (
+        patch("app.worker.background.channel.get_db_context", _db),
+        patch.object(ChannelMessageRouter, "_route_inner", inner),
+    ):
+        await process_channel_event(incoming)
+        await process_channel_event(incoming)
+
+    inner.assert_awaited_once()
+
+
+async def test_a_run_that_fails_gives_its_claim_back(fake_redis: _FakeRedis) -> None:
+    """The claim is taken on receipt, not on completion, so a run that dies
+    mid-flight must release it - otherwise the redelivery that follows reads as
+    a duplicate and the question goes unanswered for fifteen minutes."""
+    incoming = _message()
+    inner = AsyncMock(side_effect=[RuntimeError("the model provider fell over"), None])
+
+    @asynccontextmanager
+    async def _db() -> Any:
+        yield AsyncMock()
+
+    with (
+        patch("app.worker.background.channel.get_db_context", _db),
+        patch.object(ChannelMessageRouter, "_route_inner", inner),
+    ):
+        await process_channel_event(incoming)
+        assert fake_redis.store == {}
+        await process_channel_event(incoming)
+
+    assert inner.await_count == 2
+
+
+async def test_a_cancelled_run_gives_its_claim_back(fake_redis: _FakeRedis) -> None:
+    """Cancellation is the case the claim would most easily outlive - a pod
+    draining mid-run - and it does not pass through `except Exception`."""
+    incoming = _message()
+    router = ChannelMessageRouter()
+
+    with (
+        patch.object(
+            ChannelMessageRouter, "_route_inner", AsyncMock(side_effect=asyncio.CancelledError)
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await router.route(incoming, AsyncMock())
+
+    assert fake_redis.store == {}
+
+
+async def test_releasing_a_delivery_with_no_message_id_touches_nothing(
+    fake_redis: _FakeRedis,
+) -> None:
+    """Nothing was claimed for it, so there is nothing to give back."""
+    await dedupe.release_delivery(_message(message_id=None))
+
+    assert fake_redis.store == {}
+
+
+async def test_releasing_without_a_configured_redis_is_a_no_op() -> None:
+    dedupe.configure(None)
+
+    await dedupe.release_delivery(_message())
+
+
+async def test_a_redis_error_while_releasing_is_logged_not_raised(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The caller is already handling a failure; replacing it with this one
+    would bury the reason the run died."""
+    dedupe.configure(cast(RedisClient, _BrokenRedis()))
+
+    with caplog.at_level("WARNING"):
+        await dedupe.release_delivery(_message())
+
+    assert "channel_dedupe_release_failed" in caplog.text
+
+
+async def test_an_edited_mention_only_admits_a_previously_ignored_post(
+    fake_redis: _FakeRedis,
+) -> None:
+    incoming = _message(platform="mattermost")
+    edited = _message(platform="mattermost", raw={"event": "post_edited"})
+    assert await dedupe.claim_delivery(edited) is False
+    assert await dedupe.claim_delivery(incoming) is True
+    assert await dedupe.claim_delivery(edited) is False
+    await dedupe.remember_unaddressed(incoming)
+    assert await dedupe.claim_delivery(edited) is True
+    assert await dedupe.claim_delivery(edited) is False
+    assert await dedupe.claim_delivery(incoming) is False
+    await dedupe.release_delivery(edited)
+    assert await dedupe.claim_delivery(edited) is True
+    fake_redis.store.clear()
+    assert await dedupe.claim_delivery(edited) is False
+
+
+async def test_edit_admission_fails_closed_without_shared_receipts() -> None:
+    edited = _message(platform="mattermost", raw={"event": "post_edited"})
+    dedupe.configure(None)
+    assert await dedupe.claim_delivery(edited) is False
+    dedupe.configure(cast(RedisClient, _BrokenRedis()))
+    assert await dedupe.claim_delivery(edited) is False
+
+
+@pytest.mark.security
+async def test_only_one_concurrent_edit_can_start_work(fake_redis: _FakeRedis) -> None:
+    original = _message(platform="mattermost")
+    await dedupe.claim_delivery(original)
+    await dedupe.remember_unaddressed(original)
+    edited = _message(platform="mattermost", raw={"event": "post_edited"})
+    claims = await asyncio.gather(*(dedupe.claim_delivery(edited) for _ in range(10)))
+    assert sum(claims) == 1
+
+
+async def test_ignored_post_tracking_is_platform_scoped_and_best_effort() -> None:
+    dedupe.configure(None)
+    await dedupe.remember_unaddressed(_message(platform="mattermost", dedupe_claimed=True))
+    redis = _FakeRedis()
+    dedupe.configure(cast(RedisClient, redis))
+    await dedupe.remember_unaddressed(_message())
+    await dedupe.remember_unaddressed(_message(platform="mattermost", message_id=None))
+    assert redis.store == {}
+    dedupe.configure(cast(RedisClient, _BrokenRedis()))
+    await dedupe.remember_unaddressed(_message(platform="mattermost", dedupe_claimed=True))
+
+
+@pytest.mark.security
+async def test_a_fail_open_original_cannot_become_an_edit_candidate() -> None:
+    original = _message(platform="mattermost")
+    dedupe.configure(None)
+    assert await dedupe.claim_delivery(original) is True
+    assert original.dedupe_claimed is False
+    redis = _FakeRedis()
+    dedupe.configure(cast(RedisClient, redis))
+    await dedupe.remember_unaddressed(original)
+    assert redis.store == {}
+    assert (
+        await dedupe.claim_delivery(_message(platform="mattermost", raw={"event": "post_edited"}))
+        is False
+    )
+
+
+async def test_durable_edit_eligibility_does_not_spend_a_redis_claim(fake_redis):
+    incoming = _message(platform="mattermost")
+    edited = _message(platform="mattermost", raw={"event": "post_edited"})
+    assert not await dedupe.edited_delivery_is_eligible(edited)
+    assert await dedupe.claim_delivery(incoming)
+    await dedupe.remember_unaddressed(incoming)
+    assert await dedupe.edited_delivery_is_eligible(edited)
+    assert await dedupe.edited_delivery_is_eligible(edited)
+    assert not any(key.endswith(":edit") for key in fake_redis.store)
+    fake_redis.store.clear()
+    assert not await dedupe.edited_delivery_is_eligible(edited)
+
+
+@pytest.mark.parametrize("case", ["unconfigured", "unavailable", "missing_id", "not_edit"])
+async def test_durable_edit_eligibility_fails_closed(monkeypatch, case):
+    incoming = _message(platform="mattermost", raw={"event": "post_edited"})
+    if case != "unconfigured":
+        monkeypatch.setattr(dedupe, "_redis", _BrokenRedis())
+    if case == "missing_id":
+        incoming.message_id = None
+    if case == "not_edit":
+        incoming.raw.clear()
+    assert not await dedupe.edited_delivery_is_eligible(incoming)

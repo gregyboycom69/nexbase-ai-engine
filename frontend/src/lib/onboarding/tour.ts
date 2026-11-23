@@ -1,0 +1,1798 @@
+import { ROUTES } from "@/lib/constants";
+import { Perm, type Permission } from "@/types/permissions";
+
+/**
+ * The builder is a detail view, so it has no static route of its own — every
+ * agent's is `/agents/<its id>`. This identity stands in for all of them: a step
+ * that lives on it carries `page: AGENT_BUILDER`, `pageKey` collapses any
+ * `/agents/<id>` pathname onto it, and the engine resolves a concrete agent to
+ * open when the walkthrough needs to enter one.
+ */
+export const AGENT_BUILDER = "agent-builder";
+
+/**
+ * One eval run's page, `/agents/<id>/evals/<run>`. Its own identity rather than
+ * the builder's, whose highlights name tabs this page does not have. Not on the
+ * first-run walk, so nothing has to resolve a run to open.
+ */
+export const EVAL_RUN = "eval-run";
+export const IMPROVEMENT = "improvement";
+/** The Improve wizard before a session exists: choosing, pricing and starting one. */
+export const IMPROVEMENT_START = "improvement-start";
+
+/** The knowledge-base detail view, `/rag/<id>`, collapsed to one identity the same way. */
+export const KB_DETAIL = "kb-detail";
+
+/**
+ * A dataset's own page, `/datasets/<id>`, collapsed the same way: its cases, its
+ * scoring and its scores. The walk opens the first dataset the reader can see.
+ */
+export const DATASET_DETAIL = "dataset-detail";
+
+/**
+ * A skill's own page, `/skills/<id>`, collapsed the same way: its agents, its
+ * history and its version tree. The walk opens the first skill the reader can see.
+ */
+export const SKILL_DETAIL = "skill-detail";
+
+/** A skill's improvement wizard, `/skills/<id>/improve/<session>`, and its start. */
+export const SKILL_IMPROVEMENT = "skill-improvement";
+export const SKILL_IMPROVEMENT_START = "skill-improvement-start";
+
+/**
+ * The two organization detail routes, collapsed the same way. Unlike the builder
+ * and the collection — one detail route each — an organization opens onto two,
+ * `/orgs/<id>/members` and `/orgs/<id>/roles`, so it takes two identities chained
+ * in one flow: the "?" walks the members page and then steps across into roles.
+ */
+export const ORG_MEMBERS = "org-members-detail";
+export const ORG_ROLES = "org-roles-detail";
+
+/**
+ * `/orgs/<id>/retention` — how long this organization keeps each class of data.
+ * Its own identity rather than a third stop on the members walk, because it is
+ * the one of the three an ordinary member never sees: the page is gated on
+ * `org:settings` and an ungated step would wait four seconds for a card the
+ * refusal never mounts.
+ */
+export const ORG_RETENTION = "org-retention-detail";
+
+/**
+ * `/orgs/<id>/groups` — the organization's groups, and who is in each. Its own
+ * walk rather than a stop on the members one: it ends on the offer to create a
+ * group, which the members walk leaves to creating an organization.
+ */
+export const ORG_GROUPS = "org-groups-detail";
+
+/**
+ * `/orgs/<id>/directory` — which directory groups make somebody what here. Its
+ * own identity for the retention page's reason: it is drawn only for a caller
+ * holding `members:manage`, which an ordinary member does not.
+ */
+export const ORG_DIRECTORY = "org-directory-detail";
+
+/**
+ * The Settings section, `/settings/*`. Its four pages — profile, account,
+ * notifications, slash-commands — share one tabbed layout, so one identity stands
+ * in for all of them and a single "?" stop points at the tabs on whichever page
+ * the reader opened it from.
+ */
+export const SETTINGS_DETAIL = "settings-detail";
+
+/**
+ * One department's page, `/groups/<id>` (#2072): its people, and adding to what it
+ * has. Opened on the first group, like a collection on the first collection.
+ */
+export const GROUP_DETAIL = "group-detail";
+
+/**
+ * A Documents folder, `/documents/<id>`, collapsed the same way. Unlike a
+ * seeded agent or collection there is no example to open from the list — a
+ * workspace is one person's own agent output — so its stop is "?"-only help shown
+ * in place, once the reader has opened one of their own.
+ */
+export const WORKSPACE_DETAIL = "workspace-detail";
+
+/** A table's detail view, `/tables/<id>`, collapsed to one identity the same way. */
+export const TABLE_DETAIL = "table-detail";
+
+/**
+ * One workflow's runs, `/workflows/<id>/runs`, collapsed the same way. Not
+ * `/workflows/runs` - every workflow's runs - which is a page of its own.
+ */
+export const WORKFLOW_DETAIL = "workflow-detail";
+
+export const WORKFLOW_RUN_DETAIL = "workflow-run-detail";
+
+export const WORKFLOW_RUNS_DETAIL = "workflow-runs-detail";
+
+/** One workflow's log, `/workflows/<id>/logs`: "?"-only and shown in place, like its runs. */
+export const WORKFLOW_LOGS_DETAIL = "workflow-logs-detail";
+
+/**
+ * An artifact's page, `/apps/<id>`, collapsed to one identity. It is the
+ * viewer, outside the dashboard layout: its strip carries its own "?" and the
+ * walk is mounted in the viewer's layout, "?"-only and shown in place.
+ */
+export const ARTIFACT_DETAIL = "artifact-detail";
+
+/**
+ * One project, `/projects/<id>`. Like a Documents folder there is no seeded
+ * example to open, so its stop is "?"-only help shown on a project of the
+ * reader's own.
+ */
+export const PROJECT_DETAIL = "project-detail";
+
+/**
+ * One stop on the guided tour.
+ *
+ * The engine (`components/onboarding`) gets the reader to `page`, optionally
+ * clicks `activate` to reveal the section the step lives in, waits for
+ * `[data-tour="<target>"]` to mount, then spotlights it with a driver.js popover
+ * carrying `onboarding.steps.<id>.title` and `.body`. A step with no `target` is
+ * an interstitial shown as a centered popover (welcome, finish); one with no
+ * `page` stays on whatever page the tour reached, so the closing card does not
+ * yank the reader back to the dashboard.
+ *
+ * `page` is a page *identity*, not always a route. Most steps name a real route
+ * and the engine navigates there. A detail view has no route of its own — there
+ * is one builder per agent — so its steps carry a pseudo-identity (`AGENT_BUILDER`)
+ * that `pageKey` maps every concrete detail pathname onto, and the engine turns
+ * back into a real URL by resolving an example to open. `activate` names another
+ * `[data-tour="…"]` the engine clicks first: a tab whose panel holds the target,
+ * so a step deep in the Builder's Toolbox tab reveals it before spotlighting.
+ *
+ * There are two readers of this list, and `inTour` is what tells them apart. The
+ * first-run walkthrough is the *curated* pass — `inTour` steps only, one or two
+ * per section, enough to say where each lives without turning a first login into
+ * a lecture, and it does step into a detail view to show a section or two of it.
+ * The header "?" is the *exhaustive* pass — every step of the section the reader
+ * is in, including the whole of a detail view it opens, so asking for help on the
+ * Agents list walks the list and then the builder, component by component. The
+ * "?" set is a superset of the launch set per section.
+ *
+ * A step is gated on the permission that renders *its own target*, not merely on
+ * being able to view the page: the create buttons are edit-gated, so a step
+ * pointing at one carries the matching `*Edit` permission. That way a Viewer's
+ * tour never stops on a control the server hid from them and left the spotlight
+ * hunting an element that will never appear — it simply skips to the next step
+ * they can act on. Copy lives in the catalog, never here, because a module
+ * evaluated at import time cannot translate.
+ */
+export interface TourStep {
+  id: string;
+  page?: string;
+  target?: string;
+  /** Controls to activate in order before spotlighting, such as a dialog and its tab. */
+  activate?: string | readonly string[];
+  permission?: Permission;
+  /** A section visible to holders of any of these grants. */
+  anyPermission?: readonly Permission[];
+  /** Part of the curated first-run walkthrough. Omitted means "?"-only. */
+  inTour?: boolean;
+  /**
+   * Skip this step when its target never mounts, rather than pinning the caption
+   * to the middle of the screen with nothing highlighted. For a stop whose control
+   * is data-conditional — the MCP catalog's filter, custom-add and connect only
+   * render once the catalog has rows — so an empty catalog drops them from the walk
+   * instead of stranding it. A required stop still shows centred, because a slow
+   * page is not the same as an absent one.
+   */
+  optional?: boolean;
+  /**
+   * Which builder the stop belongs to, where only one kind of agent's page has its
+   * target or its copy is true of one kind only. A system agent's holds no MCP
+   * servers, exposure, evals, voice or test panel, and its Toolbox offers only what
+   * it reads, so the walk leaves an ordinary agent's stops out rather than waiting
+   * for a target that never mounts or describing tools it cannot have. Omitted
+   * means both.
+   */
+  agentKind?: "ordinary" | "system";
+}
+
+export const TOUR_STEPS: readonly TourStep[] = [
+  {
+    id: "improvement-start",
+    page: IMPROVEMENT_START,
+    target: "improvement-start",
+    permission: Perm.runsView,
+  },
+  {
+    id: "improvement-test-set",
+    page: IMPROVEMENT_START,
+    target: "improvement-quote",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-question-set",
+    page: IMPROVEMENT_START,
+    target: "improvement-question-set",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-details",
+    page: IMPROVEMENT_START,
+    target: "improvement-details",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-steps",
+    page: IMPROVEMENT,
+    target: "improvement-steps",
+    permission: Perm.runsView,
+  },
+  {
+    id: "improvement-understand",
+    page: IMPROVEMENT,
+    target: "improvement-evidence",
+    activate: "improvement-step-understand",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-questions",
+    page: IMPROVEMENT,
+    target: "improvement-test-questions",
+    activate: "improvement-step-understand",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-changes",
+    page: IMPROVEMENT,
+    target: "improvement-changes",
+    activate: "improvement-step-changes",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-skill-handoffs",
+    page: IMPROVEMENT,
+    target: "improvement-skill-handoffs",
+    activate: "improvement-step-changes",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-next-step",
+    page: IMPROVEMENT,
+    target: "improvement-next-step",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-check",
+    page: IMPROVEMENT,
+    target: "improvement-check",
+    activate: "improvement-step-check",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-review",
+    page: IMPROVEMENT,
+    target: "improvement-open-check",
+    activate: "improvement-step-check",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-results",
+    page: IMPROVEMENT,
+    target: "improvement-results",
+    activate: "improvement-step-result",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-automatic-check",
+    page: IMPROVEMENT,
+    target: "improvement-automatic-check",
+    activate: "improvement-step-accept",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-guard",
+    page: IMPROVEMENT,
+    target: "improvement-guard",
+    activate: "improvement-step-accept",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "improvement-accept",
+    page: IMPROVEMENT,
+    target: "improvement-accept",
+    activate: "improvement-step-accept",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  { id: "welcome", inTour: true },
+
+  // Sidebar controls belong to the dashboard's help tour. Optional because the
+  // phone drawer may be closed when the tour reaches this step.
+  {
+    id: "organization-switcher",
+    page: ROUTES.DASHBOARD,
+    target: "organization-switcher",
+    optional: true,
+  },
+  { id: "virtual-office", page: ROUTES.VIRTUAL_OFFICE, target: "virtual-office-controls" },
+  { id: "dashboard-filters", page: ROUTES.DASHBOARD, target: "dashboard-filters", inTour: true },
+  // "?"-only: arranging the dashboard is detail the exhaustive walk covers, not a
+  // first-run essential. Ungated — the layout is the reader's own, not org-scoped.
+  // Optional, because only the organization's view is arranged and everybody
+  // opens on their own.
+  {
+    id: "dashboard-customize",
+    page: ROUTES.DASHBOARD,
+    target: "dashboard-customize",
+    optional: true,
+  },
+  // The bell itself sits in the sidebar, not this page, and is mounted on every
+  // page alike - but a `TourStep` needs a `page` to ever reach `stepsForPage`
+  // (see its own docstring), so it is anchored here the way `dashboard-customize`
+  // is: "?"-only, ungated, because every membership has its own inbox.
+  { id: "notification-bell", page: ROUTES.DASHBOARD, target: "notification-bell" },
+  // The AI Architect's corner button, on every page alike and anchored here for
+  // the same reason. Optional and gated: it is drawn only for somebody who may
+  // run agents, and only once the organization's assistant exists (#2063).
+  {
+    id: "assistant-widget",
+    page: ROUTES.DASHBOARD,
+    target: "assistant-widget",
+    permission: Perm.agentsRun,
+    optional: true,
+  },
+
+  { id: "workspace-background", page: ROUTES.WORK, target: "workspace-background" },
+  { id: "chat-start", page: ROUTES.CHAT, target: "chat-start", inTour: true },
+  { id: "chat-agent-picker", page: ROUTES.CHAT, target: "chat-agent-picker", inTour: true },
+  { id: "chat-composer", page: ROUTES.CHAT, target: "chat-composer" },
+  {
+    id: "chat-local-skills",
+    page: ROUTES.CHAT,
+    target: "chat-local-skills",
+    activate: ["chat-settings", "chat-settings-tools"],
+    optional: true,
+  },
+  {
+    id: "chat-coding-accounts",
+    page: ROUTES.CHAT,
+    target: "chat-coding-accounts",
+    activate: ["chat-settings", "chat-settings-tools"],
+    optional: true,
+  },
+  {
+    id: "chat-local-coding",
+    page: ROUTES.CHAT,
+    target: "chat-local-coding",
+    activate: ["chat-settings", "chat-settings-tools"],
+    optional: true,
+  },
+  {
+    id: "chat-coding-settings",
+    page: ROUTES.CHAT,
+    target: "chat-coding-settings",
+    activate: ["chat-settings", "chat-settings-tools"],
+    optional: true,
+  },
+  {
+    id: "chat-coding-revert",
+    page: ROUTES.CHAT,
+    target: "coding-task-revert",
+    optional: true,
+  },
+  {
+    id: "chat-background-tasks",
+    page: ROUTES.CHAT,
+    target: "chat-background-tasks",
+    optional: true,
+  },
+  // Only there once an agent has planned something, so `optional` - an
+  // organization whose agents carry no planning capability would otherwise wait
+  // four seconds for a strip that never mounts.
+  { id: "chat-plan", page: ROUTES.CHAT, target: "chat-plan", optional: true },
+  // Only where an agent has drawn something in the conversation on screen.
+  { id: "chat-visual", page: ROUTES.CHAT, target: "chat-visual", optional: true },
+  {
+    id: "chat-model-picker",
+    page: ROUTES.CHAT,
+    target: "chat-model-picker",
+    activate: ["chat-settings", "chat-settings-model"],
+  },
+  // The call button sits in the composer whenever an agent is selected - offered
+  // or crossed out - but readiness loads after the page, so the stop is optional:
+  // a slow read must not pin the caption to nothing (#54).
+  { id: "chat-voice-call", page: ROUTES.CHAT, target: "chat-voice-call", optional: true },
+  // Inside the same popover as the model, so the walk opens it - `activate` on a
+  // popover's trigger clicks it - and the next stop finds it already open.
+  // `optional` because the section renders only for someone who may change it.
+  {
+    id: "chat-approval-mode",
+    page: ROUTES.CHAT,
+    target: "chat-approval-mode",
+    activate: ["chat-settings", "chat-settings-preferences"],
+    optional: true,
+  },
+  // Same popover, and rendered only for an agent bound to each person's own
+  // account - an agent whose bindings are all the organization's has no section
+  // for the caption to pin to.
+  {
+    id: "chat-your-connections",
+    page: ROUTES.CHAT,
+    target: "chat-your-connections",
+    activate: ["chat-settings", "chat-settings-preferences"],
+    optional: true,
+  },
+
+  {
+    id: "agents-templates",
+    page: ROUTES.AGENTS,
+    target: "agents-templates",
+    activate: "page-secondary-actions",
+    permission: Perm.agentsEdit,
+    inTour: true,
+  },
+  {
+    id: "agents-new",
+    page: ROUTES.AGENTS,
+    target: "agents-new",
+    permission: Perm.agentsEdit,
+    inTour: true,
+  },
+  { id: "agents-filters", page: ROUTES.AGENTS, target: "agents-filters" },
+  // The band's toggle rather than its cards: it renders only while the
+  // organization holds a system agent, and folded it is one bounded line.
+  { id: "agents-system", page: ROUTES.AGENTS, target: "agents-system", optional: true },
+
+  // The builder, entered from the Agents list. The engine opens an example agent
+  // (the seeded "AgenticOS", or the first one there is), switches to the
+  // named tab, then spotlights the section. The launch pass takes one per tab —
+  // enough for a short line on each section; the "?" adds the sub-cards (model,
+  // MCP) the launch leaves out.
+  // Pending suggestions live beside evals and may be absent.
+  {
+    id: "agent-assistant-strip",
+    page: AGENT_BUILDER,
+    target: "agent-assistant-strip",
+    activate: "agent-tab-evals",
+    permission: Perm.agentsEdit,
+    optional: true,
+    agentKind: "ordinary",
+  },
+  {
+    id: "agent-instructions",
+    page: AGENT_BUILDER,
+    // The header, not the card: the card holds the editor and the model picker
+    // and lit half the screen. The coach's own step keeps the card (`flows.ts`),
+    // because it has the reader type into it.
+    target: "agent-instructions-header",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+    inTour: true,
+  },
+  // The first messages an empty chat offers, under the instructions (#2301).
+  {
+    id: "agent-starters",
+    page: AGENT_BUILDER,
+    target: "agent-starters",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+    agentKind: "ordinary",
+  },
+  {
+    id: "agent-model",
+    page: AGENT_BUILDER,
+    target: "agent-model",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+  },
+  {
+    id: "agent-model-credentials",
+    page: AGENT_BUILDER,
+    target: "agent-model-credentials",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+    agentKind: "ordinary",
+  },
+  // The Voice card, right under the model: dictation and, below it, the
+  // realtime model, key and voice the agent takes calls with (#54).
+  {
+    id: "agent-voice",
+    page: AGENT_BUILDER,
+    target: "agent-voice",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+    agentKind: "ordinary",
+  },
+  {
+    id: "agent-identity",
+    page: AGENT_BUILDER,
+    target: "agent-identity",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+  },
+  {
+    id: "agent-toolbox",
+    page: AGENT_BUILDER,
+    // The header, for the reason the instructions stop takes one: the card is the
+    // whole capability list. The coach keeps the card to have the reader use it.
+    target: "agent-capabilities-header",
+    activate: "agent-tab-toolbox",
+    permission: Perm.agentsView,
+    inTour: true,
+    agentKind: "ordinary",
+  },
+  {
+    id: "agent-system-toolbox",
+    page: AGENT_BUILDER,
+    target: "agent-capabilities-header",
+    activate: "agent-tab-toolbox",
+    permission: Perm.agentsView,
+    agentKind: "system",
+  },
+  {
+    id: "agent-mcp",
+    page: AGENT_BUILDER,
+    // The card's header, not the card: the picker under it holds the whole server
+    // catalog, so the card is taller than the screen and spotlighting it lit
+    // everything — see the anchor's comment in the builder page.
+    target: "agent-mcp-intro",
+    activate: "agent-tab-mcp",
+    permission: Perm.agentsView,
+    agentKind: "ordinary",
+  },
+  // What the agent is *given* - collections, skills - is picked inside the panel
+  // of the capability that reads it, so these point at the row that opens that
+  // panel rather than at the picker. The picker is two clicks in (tab, then row)
+  // and `activate` clicks one thing; the row is also the bounded element, where
+  // the panel runs past the bottom of the screen.
+  {
+    id: "agent-knowledge",
+    page: AGENT_BUILDER,
+    target: "capability-knowledge",
+    activate: "agent-tab-toolbox",
+    permission: Perm.agentsView,
+    inTour: true,
+    agentKind: "ordinary",
+  },
+  // A system agent's search picks no collection: the platform hands each run the
+  // knowledge bases it is about, and the panel sets how many steps it takes.
+  {
+    id: "agent-system-knowledge",
+    page: AGENT_BUILDER,
+    target: "capability-knowledge",
+    activate: "agent-tab-toolbox",
+    permission: Perm.agentsView,
+    agentKind: "system",
+  },
+  // Optional because a classifier's Toolbox offers no skills.
+  {
+    id: "agent-skills",
+    page: AGENT_BUILDER,
+    target: "capability-skills",
+    activate: "agent-tab-toolbox",
+    permission: Perm.agentsView,
+    inTour: true,
+    optional: true,
+  },
+  {
+    id: "agent-limits",
+    page: AGENT_BUILDER,
+    target: "agent-limits",
+    activate: "agent-tab-limits",
+    permission: Perm.agentsView,
+    inTour: true,
+  },
+  {
+    id: "agent-availability",
+    page: AGENT_BUILDER,
+    target: "agent-availability",
+    activate: "agent-tab-availability",
+    permission: Perm.agentsView,
+    inTour: true,
+    agentKind: "ordinary",
+  },
+  // The Evals tab reads the agent's eval runs, which `runs:view` gates.
+  {
+    id: "agent-evals",
+    page: AGENT_BUILDER,
+    target: "agent-evals",
+    activate: "agent-tab-evals",
+    permission: Perm.runsView,
+    agentKind: "ordinary",
+  },
+  // The suites card sits on the same tab, so the stop needs the same permission.
+  {
+    id: "agent-eval-suites",
+    page: AGENT_BUILDER,
+    target: "agent-eval-suites",
+    activate: "agent-tab-evals",
+    permission: Perm.runsView,
+    agentKind: "ordinary",
+  },
+  {
+    id: "agent-gaps",
+    page: AGENT_BUILDER,
+    target: "agent-gaps",
+    activate: "agent-tab-gaps",
+    permission: Perm.runsView,
+    agentKind: "ordinary",
+  },
+  {
+    id: "agent-history",
+    page: AGENT_BUILDER,
+    target: "agent-history",
+    activate: "agent-tab-history",
+    permission: Perm.agentsView,
+    inTour: true,
+  },
+  // The agent's improvement sessions, read with its runs.
+  {
+    id: "agent-improvement-history",
+    page: AGENT_BUILDER,
+    target: "agent-improvement-history",
+    activate: "agent-tab-history",
+    permission: Perm.runsView,
+    agentKind: "ordinary",
+    inTour: true,
+  },
+  // On the first named environment's test-connections toggle, which only an
+  // agent with one renders and only a publisher sees.
+  {
+    id: "agent-test-connections",
+    page: AGENT_BUILDER,
+    target: "environment-connections",
+    activate: "agent-tab-history",
+    permission: Perm.agentsPublish,
+    optional: true,
+    agentKind: "ordinary",
+  },
+  // On the first environment's guard toggle: which eval suites a version has to
+  // pass before that environment takes it. Read by any publisher, changed only
+  // with the override permission, so the stop needs only what the toggle does.
+  {
+    id: "agent-environment-guards",
+    page: AGENT_BUILDER,
+    target: "environment-guards",
+    activate: "agent-tab-history",
+    permission: Perm.agentsPublish,
+    optional: true,
+    agentKind: "ordinary",
+  },
+  // Beside "Draft differs from agent vN", which only a changed draft shows. Gated as
+  // the Evals tab is: the run it starts is read there.
+  {
+    id: "agent-test-draft",
+    page: AGENT_BUILDER,
+    target: "agent-test-draft",
+    permission: Perm.runsView,
+    optional: true,
+    agentKind: "ordinary",
+  },
+  // Trying it beside the Builder before publishing (#2074).
+  {
+    id: "agent-test",
+    page: AGENT_BUILDER,
+    target: "agent-test",
+    activate: "page-secondary-actions",
+    permission: Perm.agentsEdit,
+    inTour: true,
+    agentKind: "ordinary",
+  },
+  // Who reaches the agent, in one dialog (#2062). The page's "?" walk only: the
+  // launch pass already takes one stop per Builder tab.
+  {
+    id: "agent-share",
+    page: AGENT_BUILDER,
+    target: "agent-share",
+    activate: "page-secondary-actions",
+    permission: Perm.agentsView,
+  },
+  {
+    id: "agent-publish",
+    page: AGENT_BUILDER,
+    target: "agent-publish",
+    permission: Perm.agentsPublish,
+    inTour: true,
+  },
+
+  {
+    id: "eval-verdict",
+    page: EVAL_RUN,
+    target: "eval-verdict",
+    permission: Perm.runsView,
+  },
+
+  {
+    id: "skills-new",
+    page: ROUTES.SKILLS,
+    target: "skills-new",
+    permission: Perm.skillsEdit,
+    inTour: true,
+  },
+  // The gallery is where a first skill actually comes from - an empty
+  // organization has three, and writing one from scratch is the harder path.
+  {
+    id: "skills-gallery",
+    page: ROUTES.SKILLS,
+    target: "skills-gallery",
+    activate: "page-secondary-actions",
+    permission: Perm.skillsEdit,
+    inTour: true,
+  },
+  { id: "skills-list", page: ROUTES.SKILLS, target: "skills-list", permission: Perm.skillsView },
+  // Grouping by department (#2124): only where the organization has groups.
+  {
+    id: "skills-groups",
+    page: ROUTES.SKILLS,
+    target: "group-filter",
+    permission: Perm.skillsView,
+    optional: true,
+  },
+  { id: "skill-agents", page: SKILL_DETAIL, target: "skill-agents", permission: Perm.skillsView },
+  // Rendered once the agents load, and the button only on rows the caller may publish.
+  {
+    id: "skill-lines",
+    page: SKILL_DETAIL,
+    target: "skill-lines",
+    permission: Perm.skillsView,
+    optional: true,
+  },
+  {
+    id: "skill-change-version",
+    page: SKILL_DETAIL,
+    target: "skill-change-version",
+    permission: Perm.agentsEdit,
+    optional: true,
+  },
+  { id: "skill-edit", page: SKILL_DETAIL, target: "skill-edit", permission: Perm.skillsView },
+  // Improve is drawn only for an editor of this skill, which a role cannot tell,
+  // who may also read the runs it learns from.
+  {
+    id: "skill-improve",
+    page: SKILL_DETAIL,
+    target: "skill-improve",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  // Drawn only for an editor on a fork the page shows, once main has moved past it.
+  {
+    id: "skill-catch-up",
+    page: SKILL_DETAIL,
+    target: "skill-catch-up",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  // Drawn under the agents once its numbers load.
+  {
+    id: "skill-usage",
+    page: SKILL_DETAIL,
+    target: "skill-usage",
+    activate: "skill-agents-tab",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "skill-test-questions",
+    page: SKILL_DETAIL,
+    target: "skill-test-questions",
+    activate: "skill-agents-tab",
+    permission: Perm.skillsView,
+  },
+  // New fork is drawn only for an editor of this skill, which a role cannot tell.
+  {
+    id: "skill-new-fork",
+    page: SKILL_DETAIL,
+    target: "skill-new-fork",
+    permission: Perm.skillsEdit,
+    optional: true,
+  },
+  {
+    id: "skill-content",
+    page: SKILL_DETAIL,
+    target: "skill-content",
+    activate: "skill-content-tab",
+    permission: Perm.skillsView,
+  },
+  {
+    id: "skill-history",
+    page: SKILL_DETAIL,
+    target: "skill-history",
+    activate: "skill-history-tab",
+    permission: Perm.skillsView,
+  },
+
+  {
+    id: "skill-improvement-start",
+    page: SKILL_IMPROVEMENT_START,
+    target: "skill-improvement-start",
+    permission: Perm.skillsEdit,
+    optional: true,
+  },
+  // Drawn in place of the start above when the address merges a fork with main.
+  {
+    id: "skill-merge-start",
+    page: SKILL_IMPROVEMENT_START,
+    target: "skill-merge-start",
+    permission: Perm.skillsEdit,
+    optional: true,
+  },
+  {
+    id: "skill-improvement-steps",
+    page: SKILL_IMPROVEMENT,
+    target: "improvement-steps",
+    permission: Perm.runsView,
+  },
+  // Only a session catching a fork up or moving it to main merges at Changes.
+  {
+    id: "skill-merge-changes",
+    page: SKILL_IMPROVEMENT,
+    target: "skill-merge-changes",
+    activate: "improvement-step-changes",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  // Each agent's outcome exists once the line's check has run.
+  {
+    id: "skill-improvement-agents",
+    page: SKILL_IMPROVEMENT,
+    target: "skill-improvement-agents",
+    activate: "improvement-step-result",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "skill-improvement-accept",
+    page: SKILL_IMPROVEMENT,
+    target: "skill-improvement-accept",
+    activate: "improvement-step-accept",
+    permission: Perm.skillsEdit,
+    optional: true,
+  },
+  {
+    id: "skill-improvement-test-set",
+    page: SKILL_IMPROVEMENT,
+    target: "skill-improvement-test-set",
+    activate: "improvement-step-accept",
+    permission: Perm.skillsEdit,
+    optional: true,
+  },
+
+  // Standing context — the files an organization injects into every agent's
+  // prompt. Beside skills in the Build group, the same shape: a create button the
+  // launch pass points at (edit-gated), and the list the "?" adds (view-gated).
+  {
+    id: "context-new",
+    page: ROUTES.CONTEXT,
+    target: "context-new",
+    permission: Perm.contextEdit,
+    inTour: true,
+  },
+  {
+    id: "context-list",
+    page: ROUTES.CONTEXT,
+    target: "context-list",
+    permission: Perm.contextView,
+  },
+  // Grouping by department (#2124): only where the organization has groups.
+  {
+    id: "context-groups",
+    page: ROUTES.CONTEXT,
+    target: "group-filter",
+    permission: Perm.contextView,
+    optional: true,
+  },
+
+  // Groups as departments (#2072): the button that creates one for a caller who
+  // may, and the list everybody reads.
+  {
+    id: "groups-new",
+    page: ROUTES.GROUPS,
+    target: "groups-new",
+    permission: Perm.membersManage,
+    inTour: true,
+  },
+  { id: "groups-list", page: ROUTES.GROUPS, target: "groups-list" },
+  { id: "group-members", page: GROUP_DETAIL, target: "group-members" },
+  { id: "group-add-to", page: GROUP_DETAIL, target: "group-add-to" },
+
+  {
+    id: "datasets-new",
+    page: ROUTES.DATASETS,
+    target: "datasets-new",
+    permission: Perm.datasetsEdit,
+    inTour: true,
+  },
+  {
+    id: "datasets-list",
+    page: ROUTES.DATASETS,
+    target: "datasets-list",
+    permission: Perm.datasetsView,
+  },
+  // Every eval run across agents, reached from the dashboard's Eval runs card.
+  {
+    id: "evals-all",
+    page: ROUTES.EVALS,
+    target: "evals-all",
+    permission: Perm.runsView,
+  },
+  // One dataset: writing a case, having the generator draft some, and the drafts
+  // waiting for a decision - the last only while some wait.
+  {
+    id: "datasets-add-case",
+    page: DATASET_DETAIL,
+    target: "datasets-add-case",
+    permission: Perm.datasetsEdit,
+  },
+  {
+    id: "datasets-generate",
+    page: DATASET_DETAIL,
+    target: "datasets-generate",
+    activate: "datasets-generate-action",
+    permission: Perm.datasetsEdit,
+  },
+  {
+    id: "datasets-proposals",
+    page: DATASET_DETAIL,
+    target: "datasets-proposals",
+    activate: "datasets-generate-action",
+    permission: Perm.datasetsEdit,
+    optional: true,
+  },
+  {
+    id: "datasets-helper-settings",
+    page: DATASET_DETAIL,
+    target: "datasets-generator-settings",
+    activate: "datasets-settings-tab",
+    permission: Perm.datasetsEdit,
+  },
+  // Workflows — the visual editor's list. Same shape as Agents: a create button
+  // the launch pass points at (create-gated), and the status list the "?" adds
+  // (view-gated). The create control opens the blank/template dialog.
+  {
+    id: "workflows-new",
+    page: ROUTES.WORKFLOWS,
+    target: "workflows-new",
+    permission: Perm.workflowsCreate,
+    inTour: true,
+  },
+  {
+    id: "workflows-list",
+    page: ROUTES.WORKFLOWS,
+    target: "workflows-list",
+    permission: Perm.workflowsView,
+  },
+  {
+    id: "workflow-canvas-fullscreen",
+    page: WORKFLOW_DETAIL,
+    target: "workflow-canvas-fullscreen",
+    optional: true,
+  },
+  {
+    id: "workflow-step-view",
+    page: WORKFLOW_DETAIL,
+    target: "workflow-step-view",
+    optional: true,
+  },
+  {
+    id: "workflow-input-contract",
+    page: WORKFLOW_DETAIL,
+    target: "workflow-input-contract",
+    permission: Perm.workflowsEdit,
+    optional: true,
+  },
+  // Every workflow's runs, filtered on the server: one describing stop on the list.
+  {
+    id: "workflows-runs",
+    page: ROUTES.WORKFLOW_ALL_RUNS,
+    target: "workflows-runs",
+    permission: Perm.workflowsView,
+  },
+  // One workflow's runs, `/workflows/<id>/runs`: "?"-only and shown in place, like
+  // a table - there is no seeded workflow to open from the list. Ungated: anyone
+  // who reached the page may see a workflow, which is all both stops need.
+  { id: "workflow-stats", page: WORKFLOW_RUNS_DETAIL, target: "workflow-stats" },
+  { id: "workflow-run-history", page: WORKFLOW_RUNS_DETAIL, target: "workflow-run-history" },
+  {
+    id: "workflow-run-questions",
+    page: WORKFLOW_RUN_DETAIL,
+    target: "workflow-run-questions",
+    optional: true,
+  },
+  // One workflow's log, `/workflows/<id>/logs`: the lines its steps' quick logs wrote.
+  { id: "workflow-logs", page: WORKFLOW_LOGS_DETAIL, target: "workflow-logs" },
+  // The alert rules under it: drawn for anyone who may view the workflow, anchored on
+  // the card's header, and optional while the page is still loading its workflow.
+  {
+    id: "workflow-log-alerts",
+    page: WORKFLOW_LOGS_DETAIL,
+    target: "workflow-log-alerts",
+    permission: Perm.workflowsView,
+    optional: true,
+  },
+
+  // Published artifacts - pages agents wrote. Nothing to create here (a run
+  // publishes one), so a single describing stop on the list, view-gated.
+  {
+    id: "artifacts-list",
+    page: ROUTES.ARTIFACTS,
+    target: "artifacts-list",
+    permission: Perm.artifactsView,
+  },
+  // Grouping by department (#2124): only where the organization has groups.
+  {
+    id: "artifacts-groups",
+    page: ROUTES.ARTIFACTS,
+    target: "group-filter",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+  // One page, `/apps/<id>`: "?"-only and shown in place, from the "?" in its
+  // strip. The anchors sit in the strip, never in a dialog or a menu: the walk
+  // opens a tab, not a dialog, so a stop cannot reveal what a click would. The
+  // first, on the strip's own header, is always there, so "?" never closes without
+  // showing anything; the rest are `optional` - the consent warning is drawn only
+  // while a version waits for consent, the Requests button and the data-change
+  // notice only while one waits, and the owner menu only for who may change the owner.
+  {
+    id: "artifact-strip",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-strip",
+    permission: Perm.artifactsView,
+  },
+  {
+    id: "artifact-consent",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-consent",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+  {
+    id: "artifact-public-data",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-public-data",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+  {
+    id: "artifact-requests",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-requests",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+  {
+    id: "artifact-review",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-review",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+  // Only for a page that declares actions the viewer may run: the menu is drawn
+  // then and not otherwise.
+  {
+    id: "artifact-actions",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-actions",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+  {
+    id: "artifact-change-owner",
+    page: ARTIFACT_DETAIL,
+    target: "artifact-change-owner",
+    permission: Perm.artifactsView,
+    optional: true,
+  },
+
+  {
+    id: "activity-overview",
+    page: ROUTES.RUNS,
+    target: "activity-overview",
+    permission: Perm.runsView,
+    inTour: true,
+  },
+  // The three tabs the "?" digs into, each switched to and described in turn —
+  // approvals only where the caller may decide one, the same permission that
+  // renders that tab.
+  {
+    id: "activity-approvals",
+    page: ROUTES.RUNS,
+    target: "activity-approvals",
+    activate: "activity-tab-approvals",
+    permission: Perm.approvalsDecide,
+  },
+  {
+    id: "activity-runs",
+    page: ROUTES.RUNS,
+    target: "activity-runs",
+    activate: "activity-tab-runs",
+    permission: Perm.runsView,
+  },
+  {
+    id: "activity-spend",
+    page: ROUTES.RUNS,
+    target: "activity-spend",
+    activate: "activity-tab-spend",
+    permission: Perm.runsView,
+  },
+  // Inside the run drawer, which opens only when somebody has focused a run - so
+  // `optional`, like the MCP catalog's data-conditional controls. The walk skips
+  // it with the drawer closed and describes it in place when a reader presses "?"
+  // with a run open, which is exactly when the tab is worth explaining.
+  {
+    id: "run-detail-input",
+    page: ROUTES.RUNS,
+    target: "run-detail-input",
+    permission: Perm.runsView,
+    optional: true,
+  },
+  {
+    id: "runs-score-against-case",
+    page: ROUTES.RUNS,
+    target: "runs-score-against-case",
+    permission: Perm.datasetsRun,
+    optional: true,
+  },
+
+  {
+    id: "knowledge-new",
+    page: ROUTES.RAG,
+    target: "knowledge-new",
+    permission: Perm.collectionsEdit,
+    inTour: true,
+  },
+  {
+    id: "knowledge-tabs",
+    page: ROUTES.RAG,
+    target: "knowledge-tabs",
+    permission: Perm.collectionsView,
+  },
+  // Grouping by department (#2124): only where the organization has groups.
+  {
+    id: "knowledge-groups",
+    page: ROUTES.RAG,
+    target: "group-filter",
+    permission: Perm.collectionsView,
+    optional: true,
+  },
+  // The reusable connections — an S3 bucket, a drive, a repo configured once and
+  // cloned into any collection. Both stops are gated on connections:manage, the
+  // permission that renders the section and its "Add integration" button; without
+  // it the section returns null and there is nothing to spotlight.
+  {
+    id: "knowledge-integrations",
+    page: ROUTES.RAG,
+    target: "knowledge-integrations",
+    // Its own tab since #939, so the walk selects it first: a step pointing at a
+    // control inside an unselected tab waits four seconds for an element that
+    // never mounts.
+    activate: "knowledge-tab-integrations",
+    permission: Perm.connectionsManage,
+  },
+  // Optional: the "Add integration" button renders only once the connector catalog
+  // has one to add (`reusable-integrations`), so on an empty or failed catalog its
+  // target never mounts and the engine must skip the stop rather than pin a caption
+  // on nothing — the same reason the MCP catalog controls carry it.
+  {
+    id: "knowledge-add-integration",
+    page: ROUTES.RAG,
+    target: "knowledge-add-integration",
+    activate: "knowledge-tab-integrations",
+    permission: Perm.connectionsManage,
+    optional: true,
+  },
+  // The servers on the deployment's own network a collection may embed through
+  // or OCR with. Same tab and same gate as the integrations above: the section
+  // renders only for `connections:manage`, and its header always does once it
+  // renders, so the stop is not optional.
+  {
+    id: "knowledge-local-services",
+    page: ROUTES.RAG,
+    target: "knowledge-local-services",
+    activate: "knowledge-tab-integrations",
+    permission: Perm.connectionsManage,
+  },
+
+  // The collection detail, entered from the Knowledge list. Three tabs since
+  // #939, so each stop selects its own: the header and the stats strip are above
+  // them and need no `activate`, and the three sections below do.
+  { id: "kb-header", page: KB_DETAIL, target: "kb-header", permission: Perm.collectionsView },
+  {
+    id: "kb-documents",
+    page: KB_DETAIL,
+    target: "kb-documents",
+    activate: "kb-tab-documents",
+    permission: Perm.collectionsView,
+    inTour: true,
+  },
+  {
+    id: "kb-ingestion",
+    page: KB_DETAIL,
+    target: "kb-ingestion",
+    activate: "kb-tab-ingestion",
+    permission: Perm.collectionsView,
+  },
+  {
+    id: "kb-sync",
+    page: KB_DETAIL,
+    target: "kb-sync",
+    activate: "kb-tab-sync",
+    permission: Perm.collectionsView,
+  },
+  {
+    id: "kb-gaps",
+    page: KB_DETAIL,
+    target: "kb-gaps",
+    activate: "kb-tab-gaps",
+    permission: Perm.runsView,
+  },
+  // Offered only with AI assistance on, to whoever may change the base, with answers waiting.
+  {
+    id: "kb-gaps-check",
+    page: KB_DETAIL,
+    target: "kb-gaps-check",
+    activate: "kb-tab-gaps",
+    permission: Perm.agentsRun,
+    optional: true,
+  },
+
+  // Each tab stop selects its own tab; the review stop anchors on the review filter
+  // because the list below it can hold any number of results.
+  {
+    id: "dataset-grading",
+    page: DATASET_DETAIL,
+    target: "datasets-grading",
+    activate: "datasets-settings-tab",
+    permission: Perm.datasetsView,
+  },
+  {
+    id: "dataset-judge",
+    page: DATASET_DETAIL,
+    target: "datasets-grading-judge",
+    activate: "datasets-settings-tab",
+    permission: Perm.datasetsView,
+  },
+  {
+    id: "dataset-review",
+    page: DATASET_DETAIL,
+    target: "datasets-review-filter",
+    activate: "datasets-results-tab",
+    permission: Perm.datasetsView,
+  },
+
+  {
+    id: "tables-catalog",
+    page: ROUTES.TABLES,
+    target: "tables-catalog",
+    permission: Perm.tablesView,
+    inTour: true,
+  },
+  {
+    id: "tables-new",
+    page: ROUTES.TABLES,
+    target: "tables-new",
+    permission: Perm.tablesCreate,
+    inTour: true,
+  },
+  // The table detail, `/tables/<id>`. "?"-only and shown in place: it is in no
+  // section flow, so the walk never opens a table from the catalog - there is no
+  // seeded example to open, the same as `workspaces-detail` - and a "?" pressed on
+  // a table spotlights that table's own controls. `table-columns`
+  // is `optional`, not permission-gated: the button it anchors on renders from
+  // `table.can_edit`, a per-row boolean no static `Permission` can express (see
+  // `docs/virtual-tables.md#who-can-do-what`), so a role-level gate here would
+  // either hide the step from an editor or wait four seconds for a viewer whose
+  // refusal never mounted it.
+  {
+    id: "table-columns",
+    page: TABLE_DETAIL,
+    target: "table-columns",
+    activate: "page-secondary-actions",
+    optional: true,
+  },
+  // Ungated: any member who can open the table can read its triggers, and the
+  // sheet itself hides the controls from one who cannot edit them.
+  {
+    id: "table-triggers",
+    page: TABLE_DETAIL,
+    target: "table-triggers",
+    activate: "page-secondary-actions",
+  },
+  { id: "table-view-tabs", page: TABLE_DETAIL, target: "table-view-tabs" },
+
+  { id: "orgs-new", page: ROUTES.ORGS, target: "orgs-new" },
+
+  // The organization detail, entered from the workspaces list. Two routes, one
+  // walk: the organization tabs (profile, then the member list) and then a step
+  // across into the roles matrix. Ungated — any member reaches both.
+  { id: "org-profile", page: ORG_MEMBERS, target: "org-tab-profile" },
+  {
+    id: "org-governance",
+    page: ORG_MEMBERS,
+    target: "org-governance",
+    activate: "org-tab-governance",
+    anyPermission: [Perm.budgetsManage, Perm.approvalsDecide, Perm.orgSettings],
+  },
+  {
+    id: "org-proactivity",
+    page: ORG_MEMBERS,
+    target: "org-proactivity",
+    activate: "org-tab-assistant",
+    anyPermission: [Perm.budgetsManage, Perm.orgSettings],
+  },
+  {
+    id: "org-proactivity-model",
+    page: ORG_MEMBERS,
+    target: "org-proactivity-model",
+    activate: ["org-tab-assistant", "org-proactivity-expand"],
+    permission: Perm.budgetsManage,
+    anyPermission: [Perm.connectionsManage],
+    optional: true,
+  },
+  {
+    id: "org-public-attribution",
+    page: ORG_MEMBERS,
+    target: "org-public-attribution",
+    activate: "org-tab-governance",
+    permission: Perm.orgSettings,
+  },
+  {
+    id: "org-public-live-data",
+    page: ORG_MEMBERS,
+    target: "org-public-live-data",
+    activate: "org-tab-governance",
+    permission: Perm.orgSettings,
+  },
+  // Activate each settings tab before locating its card. Gated like
+  // the card, which is hidden from anybody who may not change settings.
+  {
+    id: "org-voice",
+    page: ORG_MEMBERS,
+    target: "org-voice",
+    activate: "org-tab-assistant",
+    permission: Perm.orgSettings,
+  },
+  // The AI Architect's card: drawn only on the active organization's page, and
+  // only for somebody who may change the organization's settings.
+  {
+    id: "org-assistant",
+    page: ORG_MEMBERS,
+    target: "org-assistant",
+    activate: "org-tab-assistant",
+    permission: Perm.orgSettings,
+    optional: true,
+  },
+  {
+    id: "org-system-agents",
+    page: ORG_MEMBERS,
+    target: "org-system-agents",
+    activate: "org-tab-assistant",
+    permission: Perm.budgetsManage,
+    optional: true,
+  },
+  { id: "org-members", page: ORG_MEMBERS, target: "org-members", activate: "org-tab-members" },
+  { id: "org-roles", page: ORG_ROLES, target: "org-roles" },
+  {
+    id: "org-retention",
+    page: ORG_RETENTION,
+    target: "org-retention",
+    permission: Perm.orgSettings,
+  },
+  // Groups: what a group is for, then its create button. Reading them is
+  // ungated - anyone shares with a group - and creating one is `members:manage`.
+  { id: "org-groups", page: ORG_GROUPS, target: "org-groups" },
+  {
+    id: "org-groups-new",
+    page: ORG_GROUPS,
+    target: "org-groups-new",
+    permission: Perm.membersManage,
+  },
+  // Directory mappings: how the sync decides, then adding one. The page renders
+  // only for `members:manage`. Adding hands a role out, so its button also needs
+  // `roles:manage` - two permissions a step cannot both carry - and it is gated
+  // on the rarer of the two and optional, so a caller holding that one without
+  // the other skips it rather than waits on a button that never mounts.
+  {
+    id: "org-directory",
+    page: ORG_DIRECTORY,
+    target: "org-directory",
+    permission: Perm.membersManage,
+  },
+  {
+    id: "org-directory-new",
+    page: ORG_DIRECTORY,
+    target: "org-directory-new",
+    permission: Perm.rolesManage,
+    optional: true,
+  },
+
+  {
+    id: "vault-new",
+    page: ROUTES.VAULT,
+    target: "vault-new",
+    permission: Perm.secretsEdit,
+    inTour: true,
+  },
+  { id: "vault-keys", page: ROUTES.VAULT, target: "vault-keys", permission: Perm.secretsView },
+
+  {
+    id: "mcp-catalog",
+    page: ROUTES.MCP_SERVERS,
+    target: "mcp-catalog",
+    permission: Perm.agentsView,
+    inTour: true,
+  },
+  // The catalog controls — filter, custom-add, connect — render only inside the
+  // list, which the page swaps for an empty-state card when the catalog has no
+  // rows. So they are optional: an empty catalog drops them rather than spotlighting
+  // nothing. The catalog stop above stays, because its target moves onto the
+  // empty-state card, so it always has something to point at.
+  {
+    id: "mcp-filter",
+    page: ROUTES.MCP_SERVERS,
+    target: "mcp-filter",
+    permission: Perm.agentsView,
+    optional: true,
+  },
+  {
+    id: "mcp-add",
+    page: ROUTES.MCP_SERVERS,
+    target: "mcp-add",
+    permission: Perm.connectionsManage,
+    optional: true,
+  },
+  {
+    id: "mcp-connect",
+    page: ROUTES.MCP_SERVERS,
+    target: "mcp-connect",
+    permission: Perm.agentsView,
+    optional: true,
+  },
+
+  // The chat platforms the organization is reachable on — beside MCP because it
+  // is the same kind of thing, a connection the organization owns. The add button
+  // is `channels:manage`, so the launch pass carries that; the list only needs the
+  // view the sidebar gates the section on.
+  {
+    id: "channels-new",
+    page: ROUTES.CHANNELS,
+    target: "channels-new",
+    permission: Perm.channelsManage,
+    inTour: true,
+  },
+  {
+    id: "channels-list",
+    page: ROUTES.CHANNELS,
+    target: "channels-list",
+    permission: Perm.agentsView,
+  },
+  {
+    id: "channels-phone",
+    page: ROUTES.CHANNELS,
+    target: "channels-phone",
+    permission: Perm.channelsManage,
+    optional: true,
+  },
+  { id: "phone-contact", page: SETTINGS_DETAIL, target: "phone-contact", optional: true },
+  { id: "phone-dial", page: SETTINGS_DETAIL, target: "phone-dial", optional: true },
+
+  {
+    id: "channels-diagnostics",
+    page: ROUTES.CHANNELS,
+    target: "channels-diagnostics",
+    permission: Perm.channelsManage,
+    optional: true,
+  },
+  // A Discord bot's role mappings (#2569): only on a Discord row, and only for
+  // somebody who may manage members, so optional - most organizations have none.
+  {
+    id: "channels-discord-roles",
+    page: ROUTES.CHANNELS,
+    target: "channels-discord-roles",
+    permission: Perm.membersManage,
+    optional: true,
+  },
+
+  {
+    id: "sandboxes-connections",
+    page: ROUTES.SANDBOXES,
+    target: "sandboxes-connections",
+    permission: Perm.connectionsView,
+  },
+
+  // Projects: shared instructions and files, and the chats started in them.
+  {
+    id: "projects-new",
+    page: ROUTES.PROJECTS,
+    target: "projects-new",
+    permission: Perm.projectsEdit,
+  },
+  {
+    id: "projects-list",
+    page: ROUTES.PROJECTS,
+    target: "projects-list",
+    permission: Perm.projectsView,
+  },
+  { id: "project-tracking", page: PROJECT_DETAIL, target: "project-tracking", optional: true },
+  { id: "project-tabs", page: PROJECT_DETAIL, target: "project-tabs" },
+  { id: "project-file-location", page: PROJECT_DETAIL, target: "project-file-location" },
+  { id: "project-graph", page: PROJECT_DETAIL, target: "workspace-graph", optional: true },
+
+  {
+    id: "project-file-fullscreen",
+    page: PROJECT_DETAIL,
+    target: "workspace-fullscreen",
+    optional: true,
+  },
+  {
+    id: "workspace-file-fullscreen",
+    page: WORKSPACE_DETAIL,
+    target: "workspace-fullscreen",
+    optional: true,
+  },
+  {
+    id: "agent-editor-fullscreen",
+    page: AGENT_BUILDER,
+    target: "text-editor-expand",
+    activate: "agent-tab-build",
+    permission: Perm.agentsView,
+    optional: true,
+  },
+  {
+    id: "skill-editor-fullscreen",
+    page: ROUTES.SKILLS,
+    target: "text-editor-expand",
+    permission: Perm.skillsView,
+    optional: true,
+  },
+  {
+    id: "context-editor-fullscreen",
+    page: ROUTES.CONTEXT,
+    target: "text-editor-expand",
+    permission: Perm.contextView,
+    optional: true,
+  },
+
+  // Other vendors' agents, reached over A2A (#2092). The list is what the page
+  // is for; registering is `agents:edit`, which the button carries.
+  {
+    id: "remote-agents-list",
+    page: ROUTES.REMOTE_AGENTS,
+    target: "remote-agents-list",
+    permission: Perm.agentsView,
+  },
+  {
+    id: "remote-agents-register",
+    page: ROUTES.REMOTE_AGENTS,
+    target: "remote-agents-register",
+    permission: Perm.agentsEdit,
+  },
+
+  // Routines — the org-wide home for everything an agent does on its own. Two
+  // stops: what is already running, and the two ways to start one. The create
+  // stop is gated on the run floor a trigger is created at, not on a role: a
+  // Viewer holding one explicit run grant may create one, and an ungated step
+  // would wait four seconds for a control a refusal never mounted.
+  // "?"-only, like the workspaces stop: the launch pass is deliberately six steps
+  // - welcome, the dashboard, the chat, finish - and a seventh about work nobody
+  // has scheduled yet is a page a first login has no reason to visit.
+  {
+    id: "routines-list",
+    page: ROUTES.ROUTINES,
+    target: "routines-list",
+  },
+  {
+    id: "routine-access",
+    page: ROUTES.ROUTINES,
+    target: "routine-access",
+    optional: true,
+  },
+  {
+    id: "routines-create",
+    page: ROUTES.ROUTINES,
+    target: "routines-create",
+    permission: Perm.agentsRun,
+  },
+
+  {
+    id: "routine-advanced",
+    page: ROUTES.ROUTINES,
+    target: "routine-advanced",
+    permission: Perm.agentsRun,
+    optional: true,
+  },
+
+  // What the platform brought the reader on its own (#2301). "?"-only, like the
+  // routines stop: the launch walk does not take a first login here.
+  { id: "inbox-filters", page: ROUTES.INBOX, target: "inbox-filters" },
+
+  { id: "workspaces-browser", page: ROUTES.DOCUMENTS, target: "workspaces-browser" },
+  // The detail a workspace opens onto — the file tree. "?"-only and shown in
+  // place: the reader is already on one of their own workspaces, so the walk
+  // spotlights the browser rather than opening an example there is none of.
+  { id: "workspaces-detail", page: WORKSPACE_DETAIL, target: "workspace-files" },
+  { id: "workspace-graph", page: WORKSPACE_DETAIL, target: "workspace-graph", optional: true },
+
+  // Settings — the tabbed personal section. One "?" stop on the tabs, which live
+  // in the shared layout, so it lands on whichever of the four pages the reader
+  // opened help from. Ungated: everyone has their own settings.
+  { id: "settings-tabs", page: SETTINGS_DETAIL, target: "settings-tabs" },
+  {
+    id: "personal-coding-accounts",
+    page: SETTINGS_DETAIL,
+    target: "personal-coding-accounts",
+    optional: true,
+  },
+  {
+    id: "desktop-local-agents",
+    page: SETTINGS_DETAIL,
+    target: "desktop-local-agents",
+    optional: true,
+  },
+  // The Appearance card - theme, voice glow, motion. On the profile tab only,
+  // so `optional`: help opened on another tab has no card to wait four seconds
+  // for. Ungated, like the tabs: these are every person's own preferences.
+  {
+    id: "settings-appearance",
+    page: SETTINGS_DETAIL,
+    target: "settings-appearance",
+    optional: true,
+  },
+  // Optional, because the card it anchors on renders only where an agent has
+  // written something - and an unmarked step waits four seconds for an element
+  // an empty store never mounts (#1594).
+  { id: "memory-views", page: SETTINGS_DETAIL, target: "memory-views", optional: true },
+  { id: "my-memory", page: SETTINGS_DETAIL, target: "my-memory", optional: true },
+  // Optional too: the section renders only where something is on record about the person.
+  { id: "my-claims", page: SETTINGS_DETAIL, target: "my-claims", optional: true },
+  // Optional for the same reason: the list renders only once a sign-in is kept.
+  // Optional: offered only where the deployment names a browser to sign in with.
+  { id: "sign-in-to-site", page: SETTINGS_DETAIL, target: "sign-in-to-site", optional: true },
+  { id: "my-sign-ins", page: SETTINGS_DETAIL, target: "my-sign-ins", optional: true },
+  // Optional for the same reason: the card is on one settings page of five, and
+  // the stop is offered from whichever one help was opened on.
+  { id: "settings-api-usage", page: SETTINGS_DETAIL, target: "api-usage", optional: true },
+  { id: "settings-api-keys", page: SETTINGS_DETAIL, target: "api-keys", optional: true },
+  { id: "settings-mcp-connect", page: SETTINGS_DETAIL, target: "mcp-connect", optional: true },
+  {
+    id: "settings-connected-apps",
+    page: SETTINGS_DETAIL,
+    target: "connected-apps",
+    optional: true,
+  },
+
+  { id: "finish", inTour: true },
+];
+
+/**
+ * The pages of one "?" journey, in the order the walkthrough visits them.
+ *
+ * A section that leads from a list into a detail view — the Agents list into the
+ * builder it opens — replays as one sequence, so asking for help on the list
+ * walks the list and then steps into the builder. A page named in no flow is its
+ * own journey.
+ */
+const SECTION_FLOWS: readonly (readonly string[])[] = [
+  [ROUTES.AGENTS, AGENT_BUILDER],
+  [ROUTES.RAG, KB_DETAIL],
+  [ROUTES.DATASETS, DATASET_DETAIL],
+  [ROUTES.SKILLS, SKILL_DETAIL],
+  [ROUTES.ORGS, ORG_MEMBERS, ORG_ROLES],
+];
+
+/** `/workflows/<id>/runs` - three segments, so every workflow's `/workflows/runs` is not one. */
+const WORKFLOW_RUNS_PATH = /^\/workflows\/[^/]+\/runs$/;
+const WORKFLOW_LOGS_PATH = /^\/workflows\/[^/]+\/logs$/;
+
+/** The page or modal identity for a pathname with an optional query string. */
+export function pageKey(path: string): string {
+  const [pathname = "", query] = path.split("?");
+  if (/^\/agents\/[^/]+\/?$/.test(pathname) && new URLSearchParams(query).has("improve"))
+    return IMPROVEMENT_START;
+  path = pathname;
+  if (/^\/agents\/[^/]+\/improve\/new(\/|$)/.test(path)) return IMPROVEMENT_START;
+  if (/^\/agents\/[^/]+\/improve\/[^/]+/.test(path)) return IMPROVEMENT;
+  if (/^\/agents\/[^/]+\/evals\/[^/]+/.test(path)) return EVAL_RUN;
+  if (path.startsWith(`${ROUTES.AGENTS}/`)) return AGENT_BUILDER;
+  if (path.startsWith(`${ROUTES.RAG}/`)) return KB_DETAIL;
+  if (path.startsWith(`${ROUTES.DATASETS}/`)) return DATASET_DETAIL;
+  if (/^\/skills\/[^/]+\/improve\/new(\/|$)/.test(path)) return SKILL_IMPROVEMENT_START;
+  if (/^\/skills\/[^/]+\/improve\/[^/]+/.test(path)) return SKILL_IMPROVEMENT;
+  if (path.startsWith(`${ROUTES.SKILLS}/`)) return SKILL_DETAIL;
+  if (path.startsWith(`${ROUTES.ORGS}/`)) {
+    if (path.endsWith("/roles")) return ORG_ROLES;
+    if (path.endsWith("/retention")) return ORG_RETENTION;
+    if (path.endsWith("/groups")) return ORG_GROUPS;
+    if (path.endsWith("/directory")) return ORG_DIRECTORY;
+    return ORG_MEMBERS;
+  }
+  if (path.startsWith(`${ROUTES.GROUPS}/`)) return GROUP_DETAIL;
+  if (path.startsWith(`${ROUTES.SETTINGS}/`)) return SETTINGS_DETAIL;
+  if (path.startsWith(`${ROUTES.DOCUMENTS}/`)) return WORKSPACE_DETAIL;
+  if (path.startsWith(`${ROUTES.PROJECTS}/`)) return PROJECT_DETAIL;
+  if (path.startsWith(`${ROUTES.TABLES}/`)) return TABLE_DETAIL;
+  if (path.startsWith(`${ROUTES.ARTIFACTS}/`)) return ARTIFACT_DETAIL;
+  if (/^\/workflows\/[^/]+\/runs\/[^/]+$/.test(path)) return WORKFLOW_RUN_DETAIL;
+  if (WORKFLOW_RUNS_PATH.test(path)) return WORKFLOW_RUNS_DETAIL;
+  if (WORKFLOW_LOGS_PATH.test(path)) return WORKFLOW_LOGS_DETAIL;
+  if (/^\/workflows\/[^/]+$/.test(path) && path !== ROUTES.WORKFLOW_ALL_RUNS)
+    return WORKFLOW_DETAIL;
+  return path;
+}
+
+/** The flow `pageId` belongs to, or a flow of just itself for a standalone page. */
+function flowFor(pageId: string): readonly string[] {
+  return SECTION_FLOWS.find((flow) => flow.includes(pageId)) ?? [pageId];
+}
+
+function canVisitStep(step: TourStep, can: (permission: Permission) => boolean): boolean {
+  return (
+    (!step.permission || can(step.permission)) &&
+    (!step.anyPermission || step.anyPermission.some(can))
+  );
+}
+
+/**
+ * The curated first-run walkthrough: the `inTour` steps, permission-filtered the
+ * way the sidebar is, so a Viewer's tour is exactly the sections they can act on.
+ */
+export function visibleTourSteps(can: (permission: Permission) => boolean): readonly TourStep[] {
+  return TOUR_STEPS.filter((step) => step.inTour && canVisitStep(step, can));
+}
+
+/**
+ * Every highlight the "?" replays for the page at `path`, permission-filtered.
+ *
+ * It is the current page's own stops plus everything downstream of it in the same
+ * flow: on the Agents list, the list stops and then the whole builder walk; on a
+ * builder route, the builder walk alone, because the reader is already past the
+ * list. Richer than the launch pass — it returns a section's `inTour` stops *and*
+ * its "?"-only ones. The interstitials (welcome, finish) have no page and never
+ * appear here.
+ *
+ * `systemAgent` says the builder on screen is a system agent's, which a path
+ * cannot: it walks that page's own stops instead of an ordinary agent's. The
+ * Agents list never opens one - its example is an agent from a list system agents
+ * are left out of.
+ */
+export function stepsForPage(
+  path: string,
+  can: (permission: Permission) => boolean,
+  systemAgent = false,
+): readonly TourStep[] {
+  const current = pageKey(path);
+  const flow = flowFor(current);
+  const reachable = new Set(flow.slice(flow.indexOf(current)));
+  const kind = systemAgent ? "system" : "ordinary";
+  return TOUR_STEPS.filter(
+    (step) =>
+      step.page !== undefined &&
+      reachable.has(step.page) &&
+      canVisitStep(step, can) &&
+      (step.agentKind === undefined || step.agentKind === kind),
+  );
+}
+
+/**
+ * Whether this registry holds any stop for `path` at all — the question the "?"
+ * button asks before offering itself.
+ *
+ * Deliberately blind to permissions, and that is the whole reason it is separate
+ * from `stepsForPage`: the button lives in a header twenty surfaces render, and
+ * making it wait on the permission query would drag react-query into every one of
+ * them for an answer that only ever differs on a page which *has* stops. A page
+ * with none in the registry — the deployment-admin section, the component
+ * playground — can never grow them from a permission, so this is the whole of it;
+ * a page whose stops a permission happens to filter to zero is caught later, by
+ * `useOnboardingTour` closing a walk that opened empty.
+ */
+export function pageHasSteps(path: string): boolean {
+  return stepsForPage(path, () => true).length > 0;
+}

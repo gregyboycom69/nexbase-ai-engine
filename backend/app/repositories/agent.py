@@ -1,0 +1,1362 @@
+"""Agent registry repositories (PostgreSQL async).
+
+Listing an agent is not a plain org filter: what a member sees depends on their
+role scope and on what was shared with them, so `list_visible` takes the
+predicate pieces the access layer resolved rather than re-deriving them here.
+"""
+
+from collections.abc import Collection, Sequence
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import JsonValue, TypeAdapter
+from sqlalchemy import (
+    Float,
+    Text,
+    and_,
+    bindparam,
+    cast,
+    false,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONPATH
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.sql.elements import ColumnElement
+
+from app.agents.spec import CapabilityBindingSpec, StarterIcon, StarterIcons, StarterTitles
+from app.db.locks import LockScope, hold_subject_shared
+from app.db.models.agent import Agent, AgentKind, AgentStatus, AgentVersion
+from app.db.models.agent_environment import AgentEnvironment
+from app.db.models.agent_exposure import AgentExposure
+from app.db.models.agent_run import AgentRun, RunStatus
+from app.db.models.context import ContextFile
+from app.db.models.organization_assistant import OrganizationAssistant
+from app.db.models.project import Project
+from app.db.models.resource_grant import Visibility
+from app.db.models.skill import Skill, SkillResource
+from app.schemas.agent import PublishedCodingAgent
+
+
+async def get_many(
+    db: AsyncSession, agent_ids: Sequence[UUID], *, organization_id: UUID
+) -> dict[UUID, Agent]:
+    """Several agents at once, by id, inside one organization.
+
+    One statement rather than a lookup per row: the callers are listings that
+    need a name beside each of a page of rows, and a query each is how a table of
+    thirty becomes thirty round trips.
+    """
+    if not agent_ids:
+        return {}
+    result = await db.execute(
+        select(Agent).where(Agent.id.in_(list(agent_ids)), Agent.organization_id == organization_id)
+    )
+    return {agent.id: agent for agent in result.scalars().all()}
+
+
+async def drafts_mentioning(db: AsyncSession, needle: str, *, organization_id: UUID) -> list[Agent]:
+    """Live agents whose draft spec contains `needle` anywhere in its text.
+
+    A cheap first pass for a caller that then parses each draft: an id bound by an
+    inline specialist sits deep inside a capability's config, where no column or
+    JSON path the query could name reaches it.
+    """
+    result = await db.execute(
+        select(Agent).where(
+            Agent.organization_id == organization_id,
+            Agent.status != AgentStatus.ARCHIVED.value,
+            cast(Agent.draft_spec, Text).contains(needle, autoescape=True),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def existing_ids_locked(
+    db: AsyncSession, agent_ids: Collection[UUID], *, organization_id: UUID
+) -> set[UUID]:
+    """Which of these agents still exist, locked so they cannot be deleted until commit.
+
+    For the deferred approval write. A delegate whose gated call was parked can be
+    deleted between the call and the run's terminal write - the write is deferred to
+    that point - and its id rides on the approval row as a `SET NULL` foreign key.
+    Inserting the row would then violate that key and roll the whole parked run
+    back, so the writer nulls an id whose agent is gone. `FOR KEY SHARE` - the lock
+    an insert referencing the row would itself take - holds the survivors so a
+    concurrent delete cannot slip in between this check and that insert, which is
+    the guarantee the old inline insert had and a bare existence check would lose.
+    """
+    if not agent_ids:
+        return set()
+    result = await db.execute(
+        select(Agent.id)
+        .where(Agent.id.in_(list(agent_ids)), Agent.organization_id == organization_id)
+        .with_for_update(read=True, key_share=True)
+    )
+    return set(result.scalars().all())
+
+
+async def get(
+    db: AsyncSession, agent_id: UUID, *, organization_id: UUID, for_update: bool = False
+) -> Agent | None:
+    statement = select(Agent).where(Agent.id == agent_id, Agent.organization_id == organization_id)
+    if for_update:
+        # Re-read after waiting, without blocking new runs' foreign-key key-share locks.
+        statement = statement.with_for_update(key_share=True).execution_options(
+            populate_existing=True
+        )
+    result = await db.execute(statement)
+    return result.scalar_one_or_none()
+
+
+async def try_lock(db: AsyncSession, agent_id: UUID, *, organization_id: UUID) -> Agent | None:
+    """Refresh the agent under its mutation lock; return None if missing or busy.
+
+    A settlement may hold result rows a foreground suite edit needs. Never
+    wait for that edit's agent lock: the periodic promotion sweep can retry.
+    A savepoint keeps a busy row from aborting the result's transaction.
+    """
+    try:
+        async with db.begin_nested():
+            result = await db.execute(
+                select(Agent)
+                .where(Agent.id == agent_id, Agent.organization_id == organization_id)
+                .with_for_update(key_share=True, nowait=True)
+                .execution_options(populate_existing=True)
+            )
+            return result.scalar_one_or_none()
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) != "55P03":
+            raise
+        return None
+
+
+async def lock(db: AsyncSession, agent_id: UUID, *, organization_id: UUID) -> Agent | None:
+    """The agent locked until the transaction ends, its draft read afresh."""
+    result = await db.execute(
+        select(Agent)
+        .where(Agent.id == agent_id, Agent.organization_id == organization_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_for_workflow_node(
+    db: AsyncSession, *, workflow_id: UUID, node_id: UUID, organization_id: UUID, lock: bool = False
+) -> Agent | None:
+    """The agent one workflow step configures in place, if it has run before.
+
+    `lock` holds the row for a caller about to publish a version of it, so two
+    runs of the same step that both find the spec changed publish it once.
+    """
+    query = select(Agent).where(
+        Agent.organization_id == organization_id,
+        Agent.workflow_id == workflow_id,
+        Agent.workflow_node_id == node_id,
+    )
+    if lock:
+        query = query.with_for_update()
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def get_served_over_a2a(db: AsyncSession, agent_id: UUID) -> Agent | None:
+    """A published agent its organization chose to serve over A2A, whatever the tenant.
+
+    The one cross-tenant read by id, because an agent card is fetched before any
+    caller is known. What it finds is only what the organization made discoverable -
+    and not an assistant it has switched off, which reads as no agent at all.
+    """
+    switched_off = select(OrganizationAssistant.agent_id).where(
+        OrganizationAssistant.agent_id == agent_id, OrganizationAssistant.enabled.is_(False)
+    )
+    result = await db.execute(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.a2a_enabled.is_(True),
+            Agent.status == AgentStatus.PUBLISHED.value,
+            Agent.current_version_id.is_not(None),
+            Agent.id.not_in(switched_off),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_shipped_starter(db: AsyncSession, *, organization_id: UUID) -> Agent | None:
+    """Keep finding the installed starter after its owner renames it."""
+    result = await db.execute(
+        select(Agent)
+        .where(
+            Agent.organization_id == organization_id,
+            Agent.shipped_template["key"].astext == "general/agenticos",
+        )
+        .order_by(Agent.created_at, Agent.id)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_by_slug(db: AsyncSession, slug: str, *, organization_id: UUID) -> Agent | None:
+    result = await db.execute(
+        select(Agent).where(Agent.slug == slug, Agent.organization_id == organization_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_system(db: AsyncSession, *, organization_id: UUID, key: str) -> Agent | None:
+    """The organization's seeded agent registered under `key`, if it has one."""
+    result = await db.execute(
+        select(Agent).where(Agent.organization_id == organization_id, Agent.system_key == key)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_slugs(db: AsyncSession, *, organization_id: UUID) -> set[str]:
+    """Every agent slug in this organization.
+
+    One query rather than a lookup per shipped template: the template catalog
+    marks two dozen rows as installed, and a slug is what an install would
+    collide on.
+    """
+    result = await db.execute(select(Agent.slug).where(Agent.organization_id == organization_id))
+    return set(result.scalars().all())
+
+
+def _visible_clauses(
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+    see_all: bool,
+    shared_ids: list[UUID],
+    shared_with_me: bool,
+    include_archived: bool,
+    kind: AgentKind,
+) -> list[ColumnElement[bool]]:
+    """The rows a member may list, before any discovery filter narrows them.
+
+    Shared by `list_visible` and `list_visible_labels` so the filter's choices
+    can never be drawn from a wider set than the listing they filter. `kind`
+    keeps one kind of agent: the ones people use, or the judges.
+    """
+    # A workflow step's own agent is configured in its workflow, not the catalog.
+    where: list[ColumnElement[bool]] = [
+        Agent.organization_id == organization_id,
+        Agent.workflow_id.is_(None),
+        Agent.kind == kind.value,
+    ]
+    if not include_archived:
+        where.append(Agent.status != AgentStatus.ARCHIVED.value)
+    if shared_with_me:
+        where.append(
+            and_(
+                or_(
+                    Agent.visibility == Visibility.ORG.value,
+                    Agent.id.in_(shared_ids) if shared_ids else false(),
+                ),
+                # IS DISTINCT FROM, not !=: an ownerless row is not the caller's.
+                Agent.owner_user_id.is_distinct_from(user_id),
+            )
+        )
+    elif not see_all:
+        where.append(
+            or_(
+                Agent.owner_user_id == user_id,
+                Agent.visibility == Visibility.ORG.value,
+                Agent.id.in_(shared_ids) if shared_ids else false(),
+            )
+        )
+    return where
+
+
+async def list_visible(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+    see_all: bool,
+    shared_ids: list[UUID],
+    shared_with_me: bool = False,
+    include_archived: bool = False,
+    kind: AgentKind = AgentKind.AGENT,
+    categories: Sequence[str] = (),
+    tags: Sequence[str] = (),
+    skip: int = 0,
+    limit: int = 50,
+) -> tuple[list[Agent], int]:
+    """Agents this member may see, with a total count.
+
+    Args:
+        see_all: True when the role reaches the whole organization; the
+            ownership predicate is then skipped entirely.
+        shared_ids: Agent ids explicitly shared with this member.
+        shared_with_me: Narrow to rows deliberately shared with the caller -
+            org-visible or explicitly granted, and not their own. Applied
+            whatever the role's scope: for a role that already sees
+            everything, "shared with me" is still a question about grants
+            and visibility, not reach.
+        categories: Discovery filter - keep rows whose categories overlap this
+            list (`&&`). Already normalized and bounded by the caller; an empty
+            list applies no predicate. OR within the facet, AND across facets.
+        tags: The same overlap filter over the tags column.
+
+    The category/tag predicates are additional `AND` clauses on both the data and
+    the count query. They can only narrow an already org- and grant-scoped set,
+    never widen it, so a filter cannot surface an agent the caller could not see.
+    """
+    where = _visible_clauses(
+        organization_id=organization_id,
+        user_id=user_id,
+        see_all=see_all,
+        shared_ids=shared_ids,
+        shared_with_me=shared_with_me,
+        include_archived=include_archived,
+        kind=kind,
+    )
+    # Guard on the (already-normalized) list being non-empty: a blank param that
+    # normalized to `[]` upstream must apply no predicate rather than match `{}`.
+    if categories:
+        where.append(Agent.categories.overlap(list(categories)))
+    if tags:
+        where.append(Agent.tags.overlap(list(tags)))
+
+    query = select(Agent).where(*where)
+    count_query = select(func.count(Agent.id)).where(*where)
+    query = query.order_by(Agent.created_at.desc()).offset(skip).limit(limit)
+    items = list((await db.execute(query)).scalars().all())
+    total = (await db.execute(count_query)).scalar() or 0
+    return items, total
+
+
+async def list_visible_labels(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+    see_all: bool,
+    shared_ids: list[UUID],
+    shared_with_me: bool = False,
+    include_archived: bool = False,
+    kind: AgentKind = AgentKind.AGENT,
+) -> tuple[list[str], list[str]]:
+    """Every distinct category and tag on the agents this member may list.
+
+    The discovery filter's choices, sorted. Drawn from the same visibility as
+    `list_visible` but independent of the filter and paging: a choice that
+    vanished once picked, or with the page that showed it, would strand
+    whoever picked it. A private agent the caller cannot see contributes
+    nothing, so its labels are not disclosed through the menu.
+    """
+    where = _visible_clauses(
+        organization_id=organization_id,
+        user_id=user_id,
+        see_all=see_all,
+        shared_ids=shared_ids,
+        shared_with_me=shared_with_me,
+        include_archived=include_archived,
+        kind=kind,
+    )
+
+    async def distinct(column: InstrumentedAttribute[list[str]]) -> list[str]:
+        labels = select(func.unnest(column).label("label")).where(*where).subquery()
+        result = await db.execute(select(labels.c.label).distinct().order_by(labels.c.label.asc()))
+        return list(result.scalars().all())
+
+    return await distinct(Agent.categories), await distinct(Agent.tags)
+
+
+async def published_budget_caps(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, float | None]:
+    """Each version's monthly cap, read off the frozen spec's JSONB.
+
+    One path extraction per row rather than loading whole specs: the listing
+    needs one float from documents that can carry kilobytes of instructions.
+    Keyed by version id - the caller joins them back onto its agents. A
+    version whose spec has no budget block answers null, same as no cap.
+    """
+    if not version_ids:
+        return {}
+    cap = AgentVersion.spec["budget"]["monthly_usd"].astext.cast(Float)
+    result = await db.execute(
+        select(AgentVersion.id, cap).where(AgentVersion.id.in_(list(version_ids)))
+    )
+    return {row[0]: row[1] for row in result.all()}
+
+
+async def published_starters(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, list[str]]:
+    """Each version's first messages, read off the frozen spec's JSONB.
+
+    The same one-path-per-row extraction as `published_budget_caps`. A version
+    published before `starters` existed has none and is absent.
+    """
+    if not version_ids:
+        return {}
+    starters = AgentVersion.spec["starters"]
+    result = await db.execute(
+        select(AgentVersion.id, starters).where(
+            AgentVersion.id.in_(list(version_ids)), starters.isnot(None)
+        )
+    )
+    return {row[0]: [str(item) for item in row[1]] for row in result.all()}
+
+
+_STARTER_ICONS = TypeAdapter(StarterIcons)
+
+
+async def published_starter_icons(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, dict[str, StarterIcon]]:
+    """Chat opener icons from frozen versions; pre-icon versions have no entry."""
+    if not version_ids:
+        return {}
+    icons = AgentVersion.spec["starter_icons"]
+    result = await db.execute(
+        select(AgentVersion.id, icons).where(
+            AgentVersion.id.in_(list(version_ids)), icons.isnot(None)
+        )
+    )
+    return {row[0]: _STARTER_ICONS.validate_python(row[1]) for row in result.all()}
+
+
+_STARTER_TITLES = TypeAdapter(StarterTitles)
+
+
+async def published_starter_titles(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, dict[str, str]]:
+    """Card titles from frozen versions, independently of the current draft."""
+    if not version_ids:
+        return {}
+    titles = AgentVersion.spec["starter_titles"]
+    result = await db.execute(
+        select(AgentVersion.id, titles).where(
+            AgentVersion.id.in_(list(version_ids)), titles.isnot(None)
+        )
+    )
+    return {row[0]: _STARTER_TITLES.validate_python(row[1]) for row in result.all()}
+
+
+_CAPABILITY_BINDINGS = TypeAdapter(list[CapabilityBindingSpec])
+
+
+async def published_capabilities(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, list[str]]:
+    """Enabled capability ids from the frozen version, never its editable draft."""
+    if not version_ids:
+        return {}
+    result = await db.execute(
+        select(AgentVersion.id, AgentVersion.spec["capabilities"]).where(
+            AgentVersion.id.in_(list(version_ids))
+        )
+    )
+    return {
+        version_id: [
+            binding.id
+            for binding in _CAPABILITY_BINDINGS.validate_python([] if raw is None else raw)
+            if binding.enabled
+        ]
+        for version_id, raw in result.all()
+    }
+
+
+async def published_local_workspaces(db: AsyncSession, *, version_ids: Sequence[UUID]) -> set[UUID]:
+    """The frozen versions whose workspace is the person's own computer.
+
+    Read from the version's published sandbox binding, never its draft: such an
+    agent has no cloud workspace, so a chat must choose a folder or the whole
+    computer before its first run.
+    """
+    if not version_ids:
+        return set()
+    result = await db.execute(
+        select(AgentVersion.id, AgentVersion.spec["capabilities"]).where(
+            AgentVersion.id.in_(list(version_ids))
+        )
+    )
+    return {
+        version_id
+        for version_id, raw in result.all()
+        if any(
+            binding.id == "sandbox"
+            and binding.enabled
+            and (binding.config or {}).get("backend") == "local"
+            for binding in _CAPABILITY_BINDINGS.validate_python([] if raw is None else raw)
+        )
+    }
+
+
+async def published_coding_agents(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, PublishedCodingAgent]:
+    """The coding agent each frozen version runs, and where it runs it.
+
+    Read from the version's published capability bindings, never its draft. A version
+    with no enabled coding agent is absent.
+    """
+    if not version_ids:
+        return {}
+    result = await db.execute(
+        select(AgentVersion.id, AgentVersion.spec["capabilities"]).where(
+            AgentVersion.id.in_(list(version_ids))
+        )
+    )
+    found: dict[UUID, PublishedCodingAgent] = {}
+    for version_id, raw in result.all():
+        for binding in _CAPABILITY_BINDINGS.validate_python([] if raw is None else raw):
+            if binding.id == "coding_agent" and binding.enabled:
+                found[version_id] = PublishedCodingAgent.model_validate(binding.config or {})
+                break
+    return found
+
+
+async def published_model_profiles(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, UUID]:
+    """Which model profile each version's frozen spec names, keyed by version id.
+
+    The same one-path-per-row extraction `published_budget_caps` does, and for the
+    same reason: the listing wants one id out of documents that can carry
+    kilobytes of instructions.
+
+    A version whose spec names no profile is absent rather than null - publish
+    validation refuses a spec without one, so it can only be a spec that predates
+    the rule, and there is nothing to resolve for it either way.
+    """
+    if not version_ids:
+        return {}
+    profile = AgentVersion.spec["model_profile_id"].astext
+    result = await db.execute(
+        select(AgentVersion.id, profile).where(AgentVersion.id.in_(list(version_ids)))
+    )
+    # `UUID(raw)` without a guard: `AgentSpec.model_profile_id` is typed, so what
+    # is frozen into the JSONB has already been through Pydantic. A malformed id
+    # cannot be published, and a branch for one would be a branch nothing reaches.
+    return {version_id: UUID(raw) for version_id, raw in result.all() if raw is not None}
+
+
+async def naming_model_profile(
+    db: AsyncSession, *, organization_id: UUID, profile_id: UUID
+) -> list[Agent]:
+    """Agents whose draft or live spec refers to this model profile anywhere.
+
+    Anywhere, because a profile id appears in more places than the agent's own
+    model: a reviewer, a specialist, the browser step model, the follow-ups
+    model, and whatever field names one next. A JSON path that visits every
+    value at any depth (`$.**`) finds every one of them without a list of
+    paths to keep in step with the spec, and it compares whole string *values*:
+    an id quoted in an agent's instructions is text inside a longer string, not
+    a reference, and does not count.
+
+    "Live" is the version the agent serves and any version an environment pins.
+    An older version nobody serves is history and holds nothing up. An archived
+    agent counts: unarchiving restores the version it served, and that version
+    would name a model that is gone.
+    """
+    variables = func.jsonb_build_object("id", str(profile_id))
+    path = cast(literal("$.** ? (@ == $id)"), JSONPATH)
+
+    def names_it(document: InstrumentedAttribute[dict[str, Any]]) -> ColumnElement[bool]:
+        return func.jsonb_path_exists(document, path, variables)
+
+    pinned = select(AgentEnvironment.version_id).where(AgentEnvironment.agent_id == Agent.id)
+    live_version = (
+        select(AgentVersion.id)
+        .where(
+            AgentVersion.agent_id == Agent.id,
+            or_(AgentVersion.id == Agent.current_version_id, AgentVersion.id.in_(pinned)),
+            names_it(AgentVersion.spec),
+        )
+        .exists()
+    )
+    channel_observer = (
+        select(AgentExposure.id)
+        .where(
+            AgentExposure.organization_id == organization_id,
+            AgentExposure.agent_id == Agent.id,
+            AgentExposure.observation["model_profile_id"].astext == str(profile_id),
+        )
+        .exists()
+    )
+    result = await db.execute(
+        select(Agent)
+        .where(
+            Agent.organization_id == organization_id,
+            or_(names_it(Agent.draft_spec), live_version, channel_observer),
+        )
+        .order_by(Agent.name.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def published_compaction_windows(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> dict[UUID, int]:
+    """The window each version's `compaction` binding overrides its model's with.
+
+    An author sets this when the resolved window is wrong - the pricing registry
+    records 1,000,000 for `anthropic:claude-sonnet-4-5` against a real 200,000 -
+    or when they want the trigger to allow for the instructions and tool schemas
+    the compaction estimator does not count. Either way it is the number the
+    *trigger* uses, so it has to be the number the gauge divides by: two figures
+    describing one ceiling, disagreeing, is what this whole area kept producing.
+
+    The capability array rather than one path, because the binding is an entry in
+    a list and JSONB has no readable way to filter one out. It is a handful of
+    small objects beside instructions that run to kilobytes.
+
+    Absent where no compaction binding is published, or where it sets no
+    override; the caller then falls back to the model's own window.
+    """
+    if not version_ids:
+        return {}
+    result = await db.execute(
+        select(AgentVersion.id, AgentVersion.spec["capabilities"]).where(
+            AgentVersion.id.in_(list(version_ids))
+        )
+    )
+    found: dict[UUID, int] = {}
+    for version_id, bindings in result.all():
+        for binding in bindings or []:
+            if binding.get("id") != "compaction":
+                continue
+            window = (binding.get("config") or {}).get("context_window")
+            if isinstance(window, int):
+                found[version_id] = window
+    return found
+
+
+async def list_all_published(db: AsyncSession) -> list[Agent]:
+    """Every published agent on the deployment, whoever owns it.
+
+    Deliberately unscoped, like :func:`app.repositories.organization.list_all`,
+    and for the same narrow reason: work that is *about* the deployment rather
+    than about a tenant. The only caller is the scheduled usage report, which has
+    no member to scope to and must reach every organization's agents to know
+    which of them asked for one. Grep for this function when auditing
+    cross-tenant reads.
+
+    Published only. A draft has no audience that agreed to hear from it - its
+    notification settings have not been published either - and archived agents
+    are not running.
+    """
+    result = await db.execute(
+        select(Agent).where(Agent.status == AgentStatus.PUBLISHED.value).order_by(Agent.created_at)
+    )
+    return list(result.scalars().all())
+
+
+async def list_current_versions(db: AsyncSession) -> list[tuple[Agent, AgentVersion]]:
+    """Every published agent paired with its default (current) version.
+
+    Deliberately unscoped, like :func:`list_all_published`, and for the same
+    narrow reason: the callers are deployment-wide, not tenant-scoped. Grep for
+    this function when auditing cross-tenant reads.
+
+    This is only the *default* pointer. A surface that names no environment runs
+    `current_version_id`, but a named environment can pin any other published
+    version and a parent can pin a delegate version - so this is one seed of the
+    runnable set, not all of it. See :func:`list_environment_versions`.
+
+    Published only. A draft has no frozen version to run, and an archived agent
+    refuses new runs - neither can hand a skill to anybody directly.
+    """
+    result = await db.execute(
+        select(Agent, AgentVersion)
+        .join(AgentVersion, AgentVersion.id == Agent.current_version_id)
+        .where(Agent.status == AgentStatus.PUBLISHED.value)
+        .order_by(Agent.organization_id, Agent.slug)
+    )
+    return list(result.all())
+
+
+async def list_environment_versions(db: AsyncSession) -> list[tuple[Agent, AgentVersion]]:
+    """Every version a named environment of a published agent pins.
+
+    Unscoped, for the same reason as :func:`list_current_versions`, and its
+    companion in the `audit-skill-bindings` sweep: publishing moves only the
+    *default* environment, so a "production" environment can stay pinned to an
+    older version that `current_version_id` no longer names. A run that targets
+    that environment loads exactly this version, so the sweep must see it too.
+
+    Published agents only, because an archived or draft agent refuses a run that
+    targets it directly. A version reachable only as a *delegate* is a different
+    path - pinned by version id from a parent's spec, followed by the caller.
+    """
+    result = await db.execute(
+        select(Agent, AgentVersion)
+        .join(AgentEnvironment, AgentEnvironment.agent_id == Agent.id)
+        .join(AgentVersion, AgentVersion.id == AgentEnvironment.version_id)
+        .where(Agent.status == AgentStatus.PUBLISHED.value)
+        .order_by(Agent.organization_id, Agent.slug)
+    )
+    return list(result.all())
+
+
+async def list_active_run_versions(db: AsyncSession) -> list[tuple[Agent, AgentVersion]]:
+    """Every version a non-terminal run still loads, each with its agent.
+
+    The third seed of the runnable set, beside :func:`list_current_versions` and
+    :func:`list_environment_versions`, and unscoped for the same reason: the
+    `audit-skill-bindings` sweep is deployment-wide. A run records the version it
+    executed in `agent_version_id`, and a run that has not ended still loads it: a
+    `running` run is executing it now, and an `awaiting_approval` run reloads it
+    when :meth:`AgentRunnerService.resume` continues it. The six terminal states -
+    `completed`, `failed`, `cancelled`, `budget_exceeded`, `guardrail_blocked` and
+    `loop_stopped` - never load it again, so there `agent_version_id` is only a historical record.
+    A parked run resumes only from stored `paused_state`; one without it can never
+    continue, so it is excluded rather than seeding a version no resume can reach.
+
+    Unlike the two companion seeds this does **not** filter to published agents.
+    `resume` re-assembles the parked version through `registry.get`, which checks
+    the agent exists and the caller may run it but not its status - so a run parked
+    before its agent was archived still resumes and still hands out that version's
+    skills. The join to `AgentVersion` drops a run whose version was deleted
+    (`agent_version_id` is `SET NULL`): there is then nothing left to reload.
+
+    A hot version with many live runs is returned once per run; the sweep
+    deduplicates by version id, exactly as it does for the default environment
+    appearing in both companion seeds.
+    """
+    result = await db.execute(
+        select(Agent, AgentVersion)
+        .select_from(AgentRun)
+        .join(AgentVersion, AgentVersion.id == AgentRun.agent_version_id)
+        .join(Agent, Agent.id == AgentVersion.agent_id)
+        .where(
+            or_(
+                AgentRun.status == RunStatus.RUNNING.value,
+                and_(
+                    AgentRun.status.in_(
+                        [RunStatus.AWAITING_APPROVAL.value, RunStatus.AWAITING_ANSWER.value]
+                    ),
+                    AgentRun.paused_state.isnot(None),
+                ),
+            )
+        )
+    )
+    return list(result.all())
+
+
+async def get_versions_with_agents(
+    db: AsyncSession, version_ids: Sequence[UUID]
+) -> list[tuple[Agent, AgentVersion]]:
+    """Specific versions, each with its agent, whoever owns them.
+
+    Unscoped and by id: the caller is the sweep resolving `SubagentRef` pins,
+    which name a delegate version directly and cross no organization boundary a
+    tenant filter could express. A pure fetch that does not filter on the agent's
+    status - the agent is returned alongside precisely so the caller can apply the
+    runtime's own rule, which refuses to delegate to an archived agent
+    (`_resolve_delegate` in `agent_runner.py`).
+    """
+    if not version_ids:
+        return []
+    result = await db.execute(
+        select(Agent, AgentVersion)
+        .select_from(AgentVersion)
+        .join(Agent, Agent.id == AgentVersion.agent_id)
+        .where(AgentVersion.id.in_(list(version_ids)))
+    )
+    return list(result.all())
+
+
+async def create(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    slug: str,
+    name: str,
+    description: str | None,
+    draft_spec: dict,
+    owner_user_id: UUID | None,
+    created_by_user_id: UUID | None,
+    visibility: str,
+    categories: list[str],
+    tags: list[str],
+    workflow_id: UUID | None = None,
+    workflow_node_id: UUID | None = None,
+) -> Agent:
+    await hold_subject_shared(db, LockScope.MODEL_PROFILE_REFERENCES, organization_id)
+    agent = Agent(
+        organization_id=organization_id,
+        slug=slug,
+        name=name,
+        description=description,
+        draft_spec=draft_spec,
+        owner_user_id=owner_user_id,
+        created_by_user_id=created_by_user_id,
+        visibility=visibility,
+        categories=categories,
+        tags=tags,
+        workflow_id=workflow_id,
+        workflow_node_id=workflow_node_id,
+    )
+    db.add(agent)
+    await db.flush()
+    await db.refresh(agent)
+    return agent
+
+
+#: The columns through which an agent comes to name a model profile.
+_NAMES_PROFILES = frozenset({"draft_spec", "current_version_id"})
+
+
+async def update(db: AsyncSession, *, agent: Agent, update_data: dict) -> Agent:
+    if _NAMES_PROFILES & update_data.keys():
+        # A write that can name a model profile waits for a delete of one in
+        # flight, and holds the next one off until it commits (#2478).
+        await hold_subject_shared(db, LockScope.MODEL_PROFILE_REFERENCES, agent.organization_id)
+    for field, value in update_data.items():
+        setattr(agent, field, value)
+    db.add(agent)
+    await db.flush()
+    await db.refresh(agent)
+    return agent
+
+
+async def delete(db: AsyncSession, agent: Agent) -> None:
+    await db.delete(agent)
+    await db.flush()
+
+
+async def next_version_number(db: AsyncSession, *, agent_id: UUID) -> int:
+    """The next version number for an agent, starting at 1."""
+    current = await db.scalar(
+        select(func.max(AgentVersion.version)).where(AgentVersion.agent_id == agent_id)
+    )
+    return (current or 0) + 1
+
+
+async def create_version(
+    db: AsyncSession,
+    *,
+    agent_id: UUID,
+    organization_id: UUID,
+    version: int,
+    spec: dict,
+    note: str | None,
+    published_by_user_id: UUID | None,
+) -> AgentVersion:
+    await hold_subject_shared(db, LockScope.MODEL_PROFILE_REFERENCES, organization_id)
+    row = AgentVersion(
+        agent_id=agent_id,
+        organization_id=organization_id,
+        version=version,
+        spec=spec,
+        note=note,
+        published_by_user_id=published_by_user_id,
+    )
+    db.add(row)
+    await db.flush()
+    await db.refresh(row)
+    return row
+
+
+async def get_version(
+    db: AsyncSession, version_id: UUID, *, organization_id: UUID
+) -> AgentVersion | None:
+    result = await db.execute(
+        select(AgentVersion).where(
+            AgentVersion.id == version_id,
+            AgentVersion.organization_id == organization_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_versions_by_ids(
+    db: AsyncSession, version_ids: Sequence[UUID], *, organization_id: UUID
+) -> dict[UUID, AgentVersion]:
+    """Several versions at once, by id, inside one organization.
+
+    One statement rather than a lookup per id, for a listing that needs the
+    number behind each of a page of pins. A missing id is absent from the map,
+    the same answer the per-id read gave.
+    """
+    if not version_ids:
+        return {}
+    result = await db.execute(
+        select(AgentVersion).where(
+            AgentVersion.id.in_(list(version_ids)),
+            AgentVersion.organization_id == organization_id,
+        )
+    )
+    return {version.id: version for version in result.scalars().all()}
+
+
+async def list_versions(
+    db: AsyncSession, *, agent_id: UUID, organization_id: UUID, skip: int = 0, limit: int = 25
+) -> list[AgentVersion]:
+    """One page of an agent's publication history, newest first."""
+    result = await db.execute(
+        select(AgentVersion)
+        .where(
+            AgentVersion.agent_id == agent_id,
+            AgentVersion.organization_id == organization_id,
+        )
+        .order_by(AgentVersion.version.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def newest_version(
+    db: AsyncSession, *, agent_id: UUID, organization_id: UUID
+) -> AgentVersion | None:
+    """The highest-numbered version, or None for an agent never published."""
+    result = await db.execute(
+        select(AgentVersion)
+        .where(
+            AgentVersion.agent_id == agent_id,
+            AgentVersion.organization_id == organization_id,
+        )
+        .order_by(AgentVersion.version.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_version_by_number(
+    db: AsyncSession, *, agent_id: UUID, number: int, organization_id: UUID
+) -> AgentVersion | None:
+    result = await db.execute(
+        select(AgentVersion).where(
+            AgentVersion.agent_id == agent_id,
+            AgentVersion.version == number,
+            AgentVersion.organization_id == organization_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def version_before(
+    db: AsyncSession, *, agent_id: UUID, number: int, organization_id: UUID
+) -> AgentVersion | None:
+    """The highest-numbered version below `number` - what a version is measured against."""
+    result = await db.execute(
+        select(AgentVersion)
+        .where(
+            AgentVersion.agent_id == agent_id,
+            AgentVersion.version < number,
+            AgentVersion.organization_id == organization_id,
+        )
+        .order_by(AgentVersion.version.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def count_for_organization(db: AsyncSession, *, organization_id: UUID) -> int:
+    """How many agents this organization holds, archived ones excluded.
+
+    Archiving is how an agent is retired, so a ceiling a retired agent went on
+    occupying would make the only way back under it a delete - and a delete takes
+    the version history and the run attribution with it.
+    """
+    result = await db.execute(
+        select(func.count(Agent.id)).where(
+            Agent.organization_id == organization_id,
+            Agent.status != AgentStatus.ARCHIVED.value,
+            # A workflow step's own agent is part of its workflow, not a seat.
+            Agent.workflow_id.is_(None),
+            Agent.kind == AgentKind.AGENT.value,
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def count_versions(db: AsyncSession, *, agent_id: UUID, organization_id: UUID) -> int:
+    """How many versions there are, which is not how many were returned.
+
+    The listing used to cap at fifty with no offset and report `total` as the
+    length of what it returned, so an agent published sixty times said it had
+    fifty versions and the ten oldest were unreachable - including whichever one
+    an environment is still pinned to.
+    """
+    result = await db.execute(
+        select(func.count())
+        .select_from(AgentVersion)
+        .where(
+            AgentVersion.agent_id == agent_id,
+            AgentVersion.organization_id == organization_id,
+        )
+    )
+    return int(result.scalar_one())
+
+
+BoundResourceField = Literal["skill_ids", "context_ids", "collection_ids"]
+
+
+async def _attach_agents(
+    db: AsyncSession, usage: dict[UUID, list[Agent]], rows: Sequence[tuple[UUID, str]]
+) -> dict[UUID, list[Agent]]:
+    """Load the agents named by `(agent id, bound id)` rows into `usage`, each list by name."""
+    if not rows:
+        return usage
+    agents = {
+        agent.id: agent
+        for agent in (
+            await db.execute(select(Agent).where(Agent.id.in_({agent_id for agent_id, _ in rows})))
+        ).scalars()
+    }
+    for agent_id, ref in sorted(rows, key=lambda row: agents[row[0]].name.casefold()):
+        usage[UUID(ref)].append(agents[agent_id])
+    return usage
+
+
+async def binding_mcp_connections(
+    db: AsyncSession, *, organization_id: UUID, connection_ids: Collection[UUID]
+) -> dict[UUID, list[Agent]]:
+    """For each organization MCP connection, the live agents whose draft binds it (#2072).
+
+    The MCP counterpart of :func:`binding_resources`: `mcp_servers` holds objects,
+    so the id is read out of each one's `connection_id` - a personal binding has
+    none and binds no connection. Same draft-not-published reason, same archived
+    agents left out, same keys and order.
+    """
+    usage: dict[UUID, list[Agent]] = {connection_id: [] for connection_id in connection_ids}
+    if not usage:
+        return usage
+    pairs = text(
+        """
+        SELECT a.id, ref ->> 'connection_id'
+        FROM agents a
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+                WHEN jsonb_typeof(a.draft_spec -> 'mcp_servers') = 'array'
+                THEN a.draft_spec -> 'mcp_servers'
+                ELSE '[]'::jsonb
+            END
+        ) AS ref
+        WHERE a.organization_id = :organization_id
+          AND a.status != :archived
+          AND ref ->> 'connection_id' IN :connection_ids
+        """
+    ).bindparams(
+        bindparam("organization_id", type_=PG_UUID(as_uuid=True)),
+        bindparam("connection_ids", expanding=True),
+    )
+    rows = (
+        await db.execute(
+            pairs,
+            {
+                "organization_id": organization_id,
+                "archived": AgentStatus.ARCHIVED.value,
+                "connection_ids": [str(connection_id) for connection_id in usage],
+            },
+        )
+    ).all()
+    return await _attach_agents(db, usage, [(agent_id, ref) for agent_id, ref in rows])
+
+
+async def binding_resources(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    field: BoundResourceField,
+    resource_ids: Collection[UUID],
+) -> dict[UUID, list[Agent]]:
+    """For each resource, the live agents whose draft binds it - in one query.
+
+    The draft rather than the published version, for the reason the vault's
+    `agents_using_for_secrets` gives: an agent about to be published with a skill
+    is using it. Archived agents are left out; nobody runs them. Every requested
+    id is a key, a resource nothing binds mapping to an empty list, and each list
+    is in name order.
+    """
+    usage: dict[UUID, list[Agent]] = {resource_id: [] for resource_id in resource_ids}
+    if not usage:
+        return usage
+    # `jsonb_array_elements_text` errors on anything that is not an array, so a
+    # draft missing the field hands it an empty one instead.
+    pairs = text(
+        f"""
+        SELECT a.id, ref
+        FROM agents a
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+            CASE
+                WHEN jsonb_typeof(a.draft_spec -> '{field}') = 'array'
+                THEN a.draft_spec -> '{field}'
+                ELSE '[]'::jsonb
+            END
+        ) AS ref
+        WHERE a.organization_id = :organization_id
+          AND a.status != :archived
+          AND ref IN :resource_ids
+        """  # noqa: S608 - `field` is one of three literals, never input
+    ).bindparams(
+        bindparam("organization_id", type_=PG_UUID(as_uuid=True)),
+        bindparam("resource_ids", expanding=True),
+    )
+    rows = (
+        await db.execute(
+            pairs,
+            {
+                "organization_id": organization_id,
+                "archived": AgentStatus.ARCHIVED.value,
+                "resource_ids": [str(resource_id) for resource_id in usage],
+            },
+        )
+    ).all()
+    return await _attach_agents(db, usage, [(agent_id, ref) for agent_id, ref in rows])
+
+
+async def system_agent_uses(
+    db: AsyncSession, agent_id: UUID, *, organization_id: UUID
+) -> list[str]:
+    """What still runs, or is set to run, on this system agent - as a person reads it.
+
+    A dataset grading with it as its judge, a knowledge base drafting or sorting its
+    gaps with it, and any request, generation, session or eval it is busy with.
+    Empty when nothing would break without it.
+    """
+    from app.db.models.authoring import AuthoringRequest, AuthoringStatus
+    from app.db.models.case_generation import CaseGeneration, GenerationStatus
+    from app.db.models.dataset import Dataset
+    from app.db.models.eval_run import EvalRun, EvalRunStatus
+    from app.db.models.improvement import ACTIVE_STATUSES, ImprovementRun
+    from app.db.models.knowledge_base import KnowledgeBase
+
+    named = str(agent_id)
+    datasets = await db.scalars(
+        select(Dataset.name)
+        .where(
+            Dataset.organization_id == organization_id,
+            Dataset.scoring["judge"]["agent_id"].astext == named,
+        )
+        .order_by(Dataset.name)
+    )
+    bases = await db.scalars(
+        select(KnowledgeBase.name)
+        .where(
+            KnowledgeBase.organization_id == organization_id,
+            or_(
+                KnowledgeBase.gap_drafter_agent_id == agent_id,
+                KnowledgeBase.gap_classifier_agent_id == agent_id,
+            ),
+        )
+        .order_by(KnowledgeBase.name)
+    )
+    uses = [f"the dataset '{name}'" for name in datasets] + [
+        f"the knowledge base '{name}'" for name in bases
+    ]
+    busy = (
+        (
+            select(AuthoringRequest.id).where(
+                AuthoringRequest.organization_id == organization_id,
+                AuthoringRequest.improver_agent_id == agent_id,
+                AuthoringRequest.status.in_(
+                    [AuthoringStatus.QUEUED.value, AuthoringStatus.RUNNING.value]
+                ),
+            ),
+            "a running authoring request",
+        ),
+        (
+            select(CaseGeneration.id).where(
+                CaseGeneration.organization_id == organization_id,
+                CaseGeneration.generator_agent_id == agent_id,
+                CaseGeneration.status == GenerationStatus.RUNNING.value,
+            ),
+            "a running case generation",
+        ),
+        (
+            select(ImprovementRun.id).where(
+                ImprovementRun.organization_id == organization_id,
+                ImprovementRun.improver_agent_id == agent_id,
+                ImprovementRun.status.in_([status.value for status in ACTIVE_STATUSES]),
+            ),
+            "a running improvement session",
+        ),
+        (
+            select(EvalRun.id).where(
+                EvalRun.organization_id == organization_id,
+                EvalRun.scoring["judge"]["agent_id"].astext == named,
+                EvalRun.status.in_([EvalRunStatus.QUEUED.value, EvalRunStatus.RUNNING.value]),
+            ),
+            "a running eval",
+        ),
+    )
+    for statement, what in busy:
+        if await db.scalar(statement.limit(1)) is not None:
+            uses.append(what)
+    return uses
+
+
+async def mutable_instruction_material(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    skill_ids: Sequence[UUID],
+    context_ids: Sequence[UUID],
+    project_id: UUID | None,
+) -> list[JsonValue]:
+    """Current scalar content, bypassing the ORM identity map of long-running jobs."""
+    material: list[JsonValue] = []
+    if skill_ids:
+        rows = await db.execute(
+            select(
+                Skill.id,
+                Skill.name,
+                Skill.description,
+                Skill.content,
+                Skill.version,
+                Skill.updated_at,
+            )
+            .where(Skill.organization_id == organization_id, Skill.id.in_(skill_ids))
+            .order_by(Skill.id)
+        )
+        for identifier, name, description, content, version, updated_at in rows:
+            material.append(
+                {
+                    "kind": "skill",
+                    "id": str(identifier),
+                    "name": name,
+                    "description": description,
+                    "content": content,
+                    "version": version,
+                    "updated_at": None if updated_at is None else updated_at.isoformat(),
+                }
+            )
+        resources = await db.execute(
+            select(
+                SkillResource.id,
+                SkillResource.skill_id,
+                SkillResource.name,
+                SkillResource.description,
+                SkillResource.content,
+                SkillResource.updated_at,
+            )
+            .join(Skill, Skill.id == SkillResource.skill_id)
+            .where(Skill.organization_id == organization_id, Skill.id.in_(skill_ids))
+            .order_by(SkillResource.skill_id, SkillResource.name)
+        )
+        for resource_id, identifier, name, description, content, updated_at in resources:
+            material.append(
+                {
+                    "kind": "skill_resource",
+                    "id": str(resource_id),
+                    "skill_id": str(identifier),
+                    "name": name,
+                    "description": description,
+                    "content": content,
+                    "updated_at": None if updated_at is None else updated_at.isoformat(),
+                }
+            )
+    if context_ids:
+        rows = await db.execute(
+            select(
+                ContextFile.id,
+                ContextFile.name,
+                ContextFile.description,
+                ContextFile.content,
+                ContextFile.format,
+                ContextFile.mode,
+                ContextFile.enabled,
+                ContextFile.updated_at,
+            )
+            .where(ContextFile.organization_id == organization_id, ContextFile.id.in_(context_ids))
+            .order_by(ContextFile.id)
+        )
+        for (
+            identifier,
+            name,
+            description,
+            content,
+            content_format,
+            mode,
+            enabled,
+            updated_at,
+        ) in rows:
+            material.append(
+                {
+                    "kind": "context",
+                    "id": str(identifier),
+                    "name": name,
+                    "description": description,
+                    "content": content,
+                    "format": content_format,
+                    "mode": mode,
+                    "enabled": enabled,
+                    "updated_at": None if updated_at is None else updated_at.isoformat(),
+                }
+            )
+    if project_id is not None:
+        row = (
+            await db.execute(
+                select(Project.name, Project.instructions, Project.updated_at).where(
+                    Project.organization_id == organization_id, Project.id == project_id
+                )
+            )
+        ).one_or_none()
+        if row is not None:
+            material.append(
+                {
+                    "kind": "project",
+                    "id": str(project_id),
+                    "name": row.name,
+                    "instructions": row.instructions,
+                    "updated_at": None if row.updated_at is None else row.updated_at.isoformat(),
+                }
+            )
+    return material
+
+
+async def delegation_candidates(
+    db: AsyncSession,
+    *,
+    organization_id: UUID,
+    user_id: UUID,
+    see_all: bool,
+    shared_ids: list[UUID],
+    after: UUID | None,
+    limit: int = 100,
+) -> list[Agent]:
+    where = _visible_clauses(
+        organization_id=organization_id,
+        user_id=user_id,
+        see_all=see_all,
+        shared_ids=shared_ids,
+        shared_with_me=False,
+        include_archived=False,
+        kind=AgentKind.AGENT,
+    )
+    where.extend(
+        [Agent.status == AgentStatus.PUBLISHED.value, Agent.current_version_id.is_not(None)]
+    )
+    if after is not None:
+        where.append(Agent.id > after)
+    return list(await db.scalars(select(Agent).where(*where).order_by(Agent.id).limit(limit)))
+
+
+async def fence_deletion(db: AsyncSession, agent_id: UUID, *, organization_id: UUID) -> None:
+    """Conflict with trigger FK key-share locks before checking whether deletion is safe."""
+    await db.scalar(
+        select(Agent.id)
+        .where(Agent.id == agent_id, Agent.organization_id == organization_id)
+        .with_for_update()
+    )
+
+
+async def published_personal_model_keys(
+    db: AsyncSession, *, version_ids: Sequence[UUID]
+) -> set[UUID]:
+    if not version_ids:
+        return set()
+    result = await db.execute(
+        select(AgentVersion.id).where(
+            AgentVersion.id.in_(list(version_ids)),
+            AgentVersion.spec["model_credential_mode"].astext == "personal",
+        )
+    )
+    return set(result.scalars().all())
